@@ -1,0 +1,44 @@
+name: build-windows
+
+# 云端编译 Windows 版 vidbar_send / vidbar_recv（无需本地安装任何编译环境）
+# 触发：手动（Actions 页 → Run workflow）或推送到 native/、build_native.py 时自动
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - native/**
+      - build_native.py
+      - .github/workflows/build-windows.yml
+
+jobs:
+  build:
+    runs-on: windows-latest      # 微软服务器自带 VS2022 / git / cmake / python
+    timeout-minutes: 240         # 首次构建 opencv+angle 约 1~2 小时，缓存命中后约 10 分钟
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # vcpkg 二进制缓存：让第二次起构建不必重编依赖
+      - name: vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: vidtx-vcpkg-binaries-v1
+
+      - name: Build vidbar_send / vidbar_recv
+        env:
+          VCPKG_ROOT: ''          # 使用脚本自带 vcpkg，避开 runner 预装实例的状态差异
+        run: python build_native.py
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: vidtx-win64-bin
+          path: bin/
+          if-no-files-found: error

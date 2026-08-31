@@ -27,6 +27,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows CI 等环境下 stdout 默认可能是 cp1252，输出中文会 UnicodeEncodeError
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 LIBCIMBAR_REPO = "https://github.com/sz3/libcimbar.git"
 LIBCIMBAR_COMMIT = "bfb0c8e471820ae493cd3694ea6bed5d5ac06c37"
 

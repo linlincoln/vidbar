@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(vidbar_recv)
+
+set (SOURCES
+        vidbar_recv.cpp
+)
+
+add_executable (
+        vidbar_recv
+        ${SOURCES}
+)
+
+target_link_libraries(vidbar_recv
+
+        cimbar_js
+        extractor
+
+        ${OPENCV_LIBS}
+        opencv_videoio
+)
+
+if(NOT MSVC)
+        add_custom_command(
+                TARGET vidbar_recv POST_BUILD
+                COMMAND ${CMAKE_STRIP} -g $<TARGET_FILE:vidbar_recv>
+        )
+endif()
+
+install(
+        TARGETS vidbar_recv
+        DESTINATION bin
+)

@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(vidbar_send)
+
+set (SOURCES
+        vidbar_send.cpp
+)
+
+add_executable (
+        vidbar_send
+        ${SOURCES}
+)
+
+target_link_libraries(vidbar_send
+
+        cimbar_js
+        encoder
+        extractor
+        gui
+
+        ${PLATFORM_GL}
+        glfw
+        ${OPENCV_LIBS}
+        opencv_videoio
+)
+
+if(NOT MSVC)
+        add_custom_command(
+                TARGET vidbar_send POST_BUILD
+                COMMAND ${CMAKE_STRIP} -g $<TARGET_FILE:vidbar_send>
+        )
+endif()
+
+install(
+        TARGETS vidbar_send
+        DESTINATION bin
+)

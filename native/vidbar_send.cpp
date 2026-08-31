@@ -1,0 +1,195 @@
+/* vidtx 定制发送端：基于 libcimbar（MPL-2.0）。
+ *
+ * 与上游 cimbar_send 的差异：
+ *  - 单个 GLFW 播放窗口贯穿整个传输（多文件循环不重开窗口，位置不重置）；
+ *  - 每轮每个文件只渲染 redundancy 倍的必需帧数（上游固定 8 倍，太浪费时间）；
+ *  - 每个文件的 encode_id 在所有轮次中保持不变 —— 接收端未完成的喷泉流
+ *    可以跨轮次持续汇聚（wirehair 种子确定，同一文件每轮产生相同的块）；
+ *  - 可选 -o <video>：不开窗口，把帧写成 MJPEG 视频（模拟采集卡信道，
+ *    用于无硬件回环测试；也是预渲染能力）。
+ *  --rounds 0 表示无限循环，直到窗口被关闭或进程被终止。
+ */
+
+#include "cimb_translator/Config.h"
+#include "encoder/EncoderPlus.h"
+#include "gui/window_glfw.h"
+
+#include "cxxopts/cxxopts.hpp"
+#include "serialize/str.h"
+
+#include <opencv2/videoio.hpp>
+
+#include <GLFW/glfw3.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using std::string;
+using std::vector;
+
+namespace {
+
+template <typename TP>
+TP wait_for_frame_time(unsigned delay, const TP& start)
+{
+	unsigned millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::high_resolution_clock::now() - start).count();
+	if (delay > millis)
+		std::this_thread::sleep_for(std::chrono::milliseconds(delay - millis));
+	return std::chrono::high_resolution_clock::now();
+}
+
+unsigned parse_mode(const string& mode)
+{
+	if (mode == "4c" or mode == "4C")
+		return 4;
+	if (mode == "Bu" or mode == "BU")
+		return 66;
+	if (mode == "Bm" or mode == "BM")
+		return 67;
+	return 68; // B
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+	cxxopts::Options options("vidbar_send", "vidtx sender: render cimbar frames to a window");
+
+	unsigned compressionLevel = cimbar::Config::compression_level();
+	options.add_options()
+		("i,in", "Input files (chunk files; manifest first)", cxxopts::value<vector<string>>())
+		("f,fps", "Target FPS", cxxopts::value<unsigned>()->default_value("30"))
+		("r,rounds", "Number of full passes over all files. 0 = loop forever", cxxopts::value<unsigned>()->default_value("0"))
+		("R,redundancy", "Frames per file, as multiple of required blocks", cxxopts::value<double>()->default_value("1.6"))
+		("b,base", "Base encode_id (0-127). Must differ between transfers", cxxopts::value<unsigned>()->default_value("0"))
+		("m,mode", "cimbar mode [B,Bm,Bu,4C]", cxxopts::value<string>()->default_value("B"))
+		("z,compression", "zstd compression level. 0 == none", cxxopts::value<int>()->default_value(turbo::str::str(compressionLevel)))
+		("p,padding", "Black padding around image in pixels", cxxopts::value<unsigned>()->default_value("32"))
+		("o,out", "Output MJPEG video file (headless mode: no window, for loopback testing)", cxxopts::value<string>())
+		("h,help", "Print usage")
+	;
+	options.show_positional_help();
+	options.parse_positional({"in"});
+	options.positional_help("<in...>");
+
+	auto result = options.parse(argc, argv);
+	if (result.count("help") or !result.count("in"))
+	{
+		std::cout << options.help() << std::endl;
+		return 0;
+	}
+
+	vector<string> infiles = result["in"].as<vector<string>>();
+	unsigned fps = result["fps"].as<unsigned>();
+	unsigned rounds = result["rounds"].as<unsigned>();
+	double redundancy = result["redundancy"].as<double>();
+	unsigned baseId = result["base"].as<unsigned>() & 0x7F;
+	compressionLevel = result["compression"].as<int>();
+	unsigned padding = result["padding"].as<unsigned>();
+
+	cimbar::Config::update(parse_mode(result["mode"].as<string>()));
+	if (fps == 0)
+		fps = 30;
+	unsigned delay = 1000 / fps;
+
+	const bool headless = result.count("out") != 0;
+
+	// ---------- 无头模式：帧写入 MJPEG 视频（模拟采集卡信道） ----------
+	if (headless)
+	{
+		string outfile = result["out"].as<string>();
+		unsigned imgX = cimbar::Config::image_size_x();
+		unsigned imgY = cimbar::Config::image_size_y();
+		cv::Size frameSize(imgX + padding * 2, imgY + padding * 2);
+
+		cv::VideoWriter vw;
+		if (!vw.open(outfile, cv::VideoWriter::fourcc('M','J','P','G'), fps, frameSize, true))
+		{
+			std::cerr << "failed to open output video: " << outfile << std::endl;
+			return 70;
+		}
+
+		EncoderPlus enc;
+		unsigned round = 0;
+		while (true)
+		{
+			++round;
+			if (rounds != 0 and round > rounds)
+				break;
+
+			for (unsigned i = 0; i < infiles.size(); ++i)
+			{
+				const string& filename = infiles[i];
+				enc.set_encode_id((baseId + i) & 0x7F);
+
+				unsigned frames = enc.encode_fountain(filename, [&] (const cv::Mat& frame, unsigned) {
+					cv::Mat canvas(frameSize, CV_8UC3, cv::Scalar(0, 0, 0));
+					cv::Rect roi(padding, padding, frame.cols, frame.rows);
+					frame.copyTo(canvas(roi));
+					vw.write(canvas);
+					return true;
+				}, compressionLevel, redundancy);
+
+				std::cerr << "round " << round << " file " << i << " (" << filename << "): "
+					<< frames << " frames" << std::endl;
+			}
+		}
+		vw.release();
+		return 0;
+	}
+
+	// ---------- 窗口模式：GLFW 播放窗口 ----------
+	// 与上游 cimbar_send 一致：高 DPI 下按显示器缩放窗口
+	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+
+	unsigned winX = cimbar::Config::image_size_x() + 16;
+	unsigned winY = cimbar::Config::image_size_y() + 16;
+	cimbar::window_glfw window(winX, winY, "vidtx player - drag onto captured screen");
+	if (!window.is_good())
+	{
+		std::cerr << "failed to create window :(" << std::endl;
+		return 70;
+	}
+	window.auto_scale_to_window(padding);
+
+	EncoderPlus enc;
+	unsigned round = 0;
+	while (true)
+	{
+		++round;
+		if (rounds != 0 and round > rounds)
+			break;
+
+		for (unsigned i = 0; i < infiles.size(); ++i)
+		{
+			if (window.should_close())
+				return 0;
+
+			const string& filename = infiles[i];
+
+			// encode_id 在轮次间保持不变：接收端可跨轮续传
+			enc.set_encode_id((baseId + i) & 0x7F);
+
+			std::chrono::time_point start = std::chrono::high_resolution_clock::now();
+			unsigned frames = enc.encode_fountain(filename, [&] (const cv::Mat& frame, unsigned) {
+				start = wait_for_frame_time(delay, start);
+				window.show(frame, 0);
+				window.shake();
+				return !window.should_close();
+			}, compressionLevel, redundancy);
+
+			std::cerr << "round " << round << " file " << i << " (" << filename << "): "
+				<< frames << " frames" << std::endl;
+			if (window.should_close())
+				return 0;
+		}
+	}
+
+	return 0;
+}

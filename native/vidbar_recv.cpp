@@ -135,7 +135,7 @@ int main(int argc, char** argv)
 		("F,fps", "Requested capture fps (0 = don't set)", cxxopts::value<unsigned>()->default_value("0"))
 		("m,mode", "cimbar mode [B,Bm,Bu,4C]", cxxopts::value<string>()->default_value("B"))
 		("c,ccm", "Color correction mode (2=auto header-based, 0=off)", cxxopts::value<int>()->default_value("2"))
-		("s,stats", "Print a stat event every N frames (0 = off)", cxxopts::value<unsigned>()->default_value("120"))
+		("s,stats", "Print a stat event every N frames, and at least every ~2 seconds (0 = off)", cxxopts::value<unsigned>()->default_value("120"))
 		("split", "Split each frame into N vertical strips, decoding one code per strip "
 		          "(2 = two side-by-side windows on ONE captured screen; 0 = auto-detect, default)",
 			cxxopts::value<unsigned>()->default_value("0"))
@@ -198,6 +198,15 @@ int main(int argc, char** argv)
 		vc.set(cv::CAP_PROP_FRAME_HEIGHT, height);
 		if (wantFps)
 			vc.set(cv::CAP_PROP_FPS, wantFps);
+		// 有些 DSHOW 驱动在改分辨率/帧率时会丢掉 FOURCC，回落到 YUY2 无压缩
+		// （带宽需求约为 MJPG 的几十倍，USB 带宽不足时实际帧率会骤降）。
+		// 重设一遍再读回校验，实际格式随 open 事件上报。
+		if (fc)
+		{
+			vc.set(cv::CAP_PROP_FOURCC, fc);
+			if (wantFps)
+				vc.set(cv::CAP_PROP_FPS, wantFps);
+		}
 	}
 
 	double realW = vc.get(cv::CAP_PROP_FRAME_WIDTH);
@@ -237,6 +246,7 @@ int main(int argc, char** argv)
 	uint64_t frames = 0, decoded = 0;
 	uint64_t stripExtOk = 0, stripDecOk = 0, fullExtOk = 0, fullDecOk = 0;
 	auto t0 = std::chrono::high_resolution_clock::now();
+	auto lastStatT = t0;
 	auto lastSignalT = t0;
 	auto lastDecodeT = t0;
 	bool hasDecoded = false;
@@ -375,8 +385,12 @@ int main(int argc, char** argv)
 			emit(fmt::format(R"({{"ev":"signal","locked":{}}})", locked ? "true" : "false"));
 		}
 
-		if (statsEvery and frames % statsEvery == 0)
+		// 统计按时间触发（≥2 秒一次）：实际帧率很低时按帧数触发会长时间无输出，
+		// 而低帧率恰恰是最需要看到 readfps 诊断的时刻。
+		if (statsEvery and (frames % statsEvery == 0 or
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatT).count() >= 2000))
 		{
+			lastStatT = now;
 			double secs = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() / 1000.0;
 			string progress;
 			for (double p : sink.get_progress())

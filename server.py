@@ -245,6 +245,12 @@ class Server:
             fps = ev.get("fps", 0)
             print(f"[+] 信号源已打开: {ev.get('w')}x{ev.get('h')} @ {fps}fps "
                   f"({ev.get('fourcc')})")
+            req = (self.args.fourcc or "").upper()
+            got = str(ev.get("fourcc") or "").upper()
+            if req and got and "?" not in got and req != got:
+                print(f"[!] 警告: 请求 {req} 但采集卡实际工作在 {got}。"
+                      f"YUY2 等无压缩格式对 USB 带宽要求极高，实际帧率可能骤降"
+                      f"（看下方 readfps 诊断）；可尝试 --api msmf 或换 USB3 接口")
             if fps and fps < 29:
                 print("[!] 注意: 实际帧率低于 30，请检查采集卡是否工作在 MJPG 模式")
         elif kind == "signal":

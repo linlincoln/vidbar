@@ -30,6 +30,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h> // SetProcessDPIAware：禁用位图缩放，保证窗口尺寸/位置是物理像素
+#endif
+
 using std::string;
 using std::vector;
 
@@ -74,6 +78,12 @@ bool parse_pos(const string& s, int& x, int& y)
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+	// 高 DPI（125%/150%）下若不声明 DPI 感知，Windows 会把窗口位图放大：
+	// 双窗口并排时右窗溢出屏幕、左窗跨过接收端切缝，解码必挂。
+	SetProcessDPIAware();
+#endif
+
 	cxxopts::Options options("vidbar_send", "vidtx sender: render cimbar frames to a window");
 
 	unsigned compressionLevel = cimbar::Config::compression_level();
@@ -237,14 +247,19 @@ int main(int argc, char** argv)
 		winY = std::min(winY, monH > 80 ? monH - 80 : 0);
 	}
 
+	// --pos 是相对目标显示器左上角的偏移；GLFW 需要虚拟桌面绝对坐标，
+	// 必须加上显示器原点，否则选副屏时窗口会跑到主屏去。
 	int posX = monX, posY = monY;  // 默认放在目标显示器左上角
 	if (result.count("pos"))
 	{
-		if (!parse_pos(result["pos"].as<string>(), posX, posY))
+		int ux = 0, uy = 0;
+		if (!parse_pos(result["pos"].as<string>(), ux, uy))
 		{
 			std::cerr << "bad --pos format, expected X,Y like 100,50" << std::endl;
 			return 71;
 		}
+		posX = monX + ux;
+		posY = monY + uy;
 	}
 
 	cimbar::window_glfw window(winX, winY, "vidtx player - drag onto captured screen");

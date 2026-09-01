@@ -133,11 +133,11 @@ def run_dual_case(src: Path, workdir: Path, fps: int, rounds: int,
         print(f"[!] ffmpeg 拼接失败: {p.stderr[-500:]}")
         return False
 
-    print("[4/5] 启动 server.py --split 2 从合成画面解码")
+    print("[4/5] 启动 server.py 从合成画面解码（自动识别双码流，不传 --split）")
     t1 = time.time()
     srv = subprocess.run(
         [sys.executable, str(ROOT / "server.py"),
-         "--source", str(combined), "-o", str(outdir), "--split", "2"],
+         "--source", str(combined), "-o", str(outdir)],
         cwd=str(ROOT), capture_output=True, text=True, timeout=timeout)
     print(srv.stdout)
     if srv.returncode != 0:

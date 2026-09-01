@@ -131,10 +131,12 @@ class Server:
 
         print(f"输出目录: {self.output_dir}")
         print(f"暂存目录: {self.staging_dir}")
+        split_desc = {0: "码流: 自动识别（单/双窗口均免配置）"}.get(self.args.split)
+        if split_desc is None:
+            split_desc = f"码流: 强制 {self.args.split} 条"
         print(f"设备: {self.args.device} | 后端: {self.args.api} | "
               f"请求: {self.args.width}x{self.args.height} @ {self.args.fps or '默认'}fps "
-              f"({self.args.fourcc})"
-              + (f" | 同帧 {self.args.split} 码流" if self.args.split > 1 else ""))
+              f"({self.args.fourcc}) | {split_desc}")
         print("等待信号...（Ctrl+C 退出）")
 
         while not self.shutdown.is_set():
@@ -175,8 +177,7 @@ class Server:
                "-s", "60"]
         if self.args.fps:
             cmd += ["-F", str(self.args.fps)]
-        if self.args.split > 1:
-            cmd += ["--split", str(self.args.split)]
+        cmd += ["--split", str(self.args.split)]
         if self.args.mode:
             cmd += ["-m", self.args.mode]
         if self.args.source:  # 回环测试：视频文件代替设备
@@ -366,6 +367,13 @@ class Server:
             parts.append(f"帧 {stat.get('frames', 0)}")
             if stat.get("readfps"):
                 parts.append(f"{stat['readfps']:.0f}fps")
+            # 码流布局诊断：prefer(1=条带 2=整帧) 及各管线 提角点/解码 成功帧数
+            prefer = stat.get("prefer")
+            if prefer is not None:
+                layout = {1: "条带", 2: "整帧"}.get(prefer, "探测中")
+                sext, sdec = stat.get("sext", 0), stat.get("sdec", 0)
+                fext, fdec = stat.get("fext", 0), stat.get("fdec", 0)
+                parts.append(f"布局:{layout} 条带提角{sext}/解出{sdec} 整帧提角{fext}/解出{fdec}")
             prog = stat.get("progress") or []
             if prog:
                 parts.append("流进度 " + ",".join(f"{p * 100:.0f}%" for p in prog))
@@ -434,8 +442,9 @@ def main() -> None:
     ap.add_argument("-F", "--fps", type=int, default=60 if IS_WIN else 30,
                     help="请求采集帧率（0=不设置，默认 Windows 60 / 其他 30）")
     ap.add_argument("-m", "--mode", default="B", help="cimbar 模式（默认 B）")
-    ap.add_argument("--split", type=int, default=1, choices=[1, 2, 3, 4],
-                    help="同帧竖切几条码流（客户端双窗口同屏模式用 2，速度约 x2）")
+    ap.add_argument("--split", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                    help="同帧竖切几条码流（0=自动识别单/双码流，默认；1=强制整帧；"
+                         "客户端双窗口同屏模式无需任何参数，自动按 2 条解）")
     ap.add_argument("--staging", default=None, help="暂存目录（默认 <输出>/.vidtx-staging）")
     ap.add_argument("--list-devices", action="store_true", help="列出可用采集设备后退出")
     args = ap.parse_args()

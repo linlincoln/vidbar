@@ -137,8 +137,8 @@ int main(int argc, char** argv)
 		("c,ccm", "Color correction mode (2=auto header-based, 0=off)", cxxopts::value<int>()->default_value("2"))
 		("s,stats", "Print a stat event every N frames (0 = off)", cxxopts::value<unsigned>()->default_value("120"))
 		("split", "Split each frame into N vertical strips, decoding one code per strip "
-		          "(2 = two side-by-side windows on ONE captured screen, for x2 throughput)",
-			cxxopts::value<unsigned>()->default_value("1"))
+		          "(2 = two side-by-side windows on ONE captured screen; 0 = auto-detect, default)",
+			cxxopts::value<unsigned>()->default_value("0"))
 		("h,help", "Print usage")
 	;
 	options.parse_positional({"in", "out"});
@@ -160,12 +160,13 @@ int main(int argc, char** argv)
 	unsigned wantFps = result["fps"].as<unsigned>();
 	unsigned statsEvery = result["stats"].as<unsigned>();
 	int colorCorrection = result["ccm"].as<int>();
-	unsigned strips = result["split"].as<unsigned>();
-	if (strips < 1 or strips > 4)
+	unsigned wantSplit = result["split"].as<unsigned>();
+	if (wantSplit > 4)
 	{
-		emit(R"({"ev":"error","msg":"--split must be 1..4"})");
+		emit(R"({"ev":"error","msg":"--split must be 0..4"})");
 		return 64;
 	}
+	unsigned strips = wantSplit ? wantSplit : 2; // 0 = 自动：先按双码流探测
 
 	cimbar::Config::update(parse_mode(result["mode"].as<string>()));
 
@@ -213,7 +214,7 @@ int main(int argc, char** argv)
 	}
 
 	emit(fmt::format(R"({{"ev":"open","source":"{}","device":{},"w":{},"h":{},"fps":{},"fourcc":"{}","split":{}}})",
-		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr), strips));
+		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr), wantSplit));
 
 	unsigned chunkSize = cimbar::Config::fountain_chunk_size();
 	auto savedCount = std::make_shared<uint64_t>(0);
@@ -221,9 +222,12 @@ int main(int argc, char** argv)
 	fountain_decoder_sink sink(chunkSize, make_store(outdir, savedCount));
 
 	// 每个竖条一条独立解码管线（角点跟踪/色彩校正等有状态，不能共享）。
+	// 多码流模式额外加一条整帧管线（下标 strips）：条带提不出角点时回退整帧解码，
+	// 使得「单窗口 / 双窗口」无需用户配置即可自动适配。
 	vector<std::unique_ptr<Extractor>> exts;
 	vector<std::unique_ptr<Decoder>> decs;
-	for (unsigned i = 0; i < strips; ++i)
+	unsigned pipelines = strips + (strips >= 2 ? 1 : 0);
+	for (unsigned i = 0; i < pipelines; ++i)
 	{
 		exts.emplace_back(new Extractor());
 		decs.emplace_back(new Decoder());
@@ -231,12 +235,17 @@ int main(int argc, char** argv)
 
 	cv::Mat mat;
 	uint64_t frames = 0, decoded = 0;
+	uint64_t stripExtOk = 0, stripDecOk = 0, fullExtOk = 0, fullDecOk = 0;
 	auto t0 = std::chrono::high_resolution_clock::now();
 	auto lastSignalT = t0;
 	auto lastDecodeT = t0;
 	bool hasDecoded = false;
 	bool locked = false;
 	unsigned consecutiveReadFail = 0;
+	// 码流布局自适应：0=未定 1=条带 2=整帧。谁先解出数据锁定谁（省 CPU）；
+	// 长期提不出角点则重置重探——用户中途增减窗口也能自愈。
+	int layoutPrefer = 0;
+	uint64_t framesSinceExtract = 0;
 
 	while (true)
 	{
@@ -258,40 +267,92 @@ int main(int argc, char** argv)
 
 		cv::UMat img = mat.getUMat(cv::ACCESS_RW).clone();
 
-		// --split N：一帧竖切 N 条，每条独立提角点+解码（同屏双码流）。
+		// --split：一帧竖切 N 条，每条独立提角点+解码（同屏并排多码流）。
+		// 自适应：条带全提不出角点时回退整帧管线；布局锁定后跳过另一侧省 CPU。
 		bool frameGood = false;
 		int decodedBytes = 0;
-		int stripRes = 0;
-		for (unsigned s = 0; s < strips; ++s)
+		bool stripDecoded = false;
+		bool stripExtracted = false;
+		if (strips == 1 or layoutPrefer == 2)
 		{
+			// 单码流：整帧解码（strips>=2 时用专用的整帧管线，下标 strips）
+			unsigned fullIdx = strips >= 2 ? strips : 0;
 			cv::UMat out;
-			int res = 0;
-			if (strips == 1)
+			int res = exts[fullIdx]->extract(img, out);
+			if (res)
 			{
-				res = exts[s]->extract(img, out);
+				frameGood = true;
+				++fullExtOk;
+				int nbytes = decs[fullIdx]->decode_fountain(out, sink,
+					res == Extractor::NEEDS_SHARPEN, colorCorrection);
+				if (nbytes > 0)
+				{
+					++decoded;
+					decodedBytes += nbytes;
+					++fullDecOk;
+				}
 			}
-			else
+		}
+		else
+		{
+			for (unsigned s = 0; s < strips; ++s)
 			{
+				cv::UMat out;
 				int x0 = static_cast<int>(static_cast<long long>(mat.cols) * s / strips);
 				int x1 = static_cast<int>(static_cast<long long>(mat.cols) * (s + 1) / strips);
 				cv::UMat strip = img(cv::Rect(x0, 0, x1 - x0, mat.rows));
-				res = exts[s]->extract(strip, out);
+				int res = exts[s]->extract(strip, out);
+				if (!res)
+					continue;
+				frameGood = true;
+				stripExtracted = true;
+				++stripExtOk;
+				int nbytes = decs[s]->decode_fountain(out, sink,
+					res == Extractor::NEEDS_SHARPEN, colorCorrection);
+				if (nbytes > 0)
+				{
+					++decoded;
+					decodedBytes += nbytes;
+					stripDecoded = true;
+				}
 			}
-			if (!res)
-				continue;
-			frameGood = true;
-			stripRes |= res;
-			bool shouldPreprocess = (res == Extractor::NEEDS_SHARPEN);
-			int nbytes = decs[s]->decode_fountain(out, sink, shouldPreprocess, colorCorrection);
-			if (nbytes > 0)
+			// 整帧回退：布局未定，或条带全提不出角点（码流跨条带边界/单码流居中）
+			if (layoutPrefer != 1 or !stripExtracted)
 			{
-				++decoded;
-				decodedBytes += nbytes;
+				cv::UMat out;
+				int res = exts[strips]->extract(img, out);
+				if (res)
+				{
+					frameGood = true;
+					++fullExtOk;
+					int nbytes = decs[strips]->decode_fountain(out, sink,
+						res == Extractor::NEEDS_SHARPEN, colorCorrection);
+					if (nbytes > 0)
+					{
+						++decoded;
+						decodedBytes += nbytes;
+						++fullDecOk;
+					}
+				}
 			}
 		}
+
+		// 布局锁定与自愈
+		if (decodedBytes > 0)
+			layoutPrefer = stripDecoded ? 1 : 2;
+		if (frameGood)
+		{
+			framesSinceExtract = 0;
+		}
+		else if (++framesSinceExtract > 300 and layoutPrefer != 0)
+		{
+			layoutPrefer = 0; // ~10s 无角点：重探布局（窗口被移动/增减）
+			framesSinceExtract = 0;
+		}
+
 		if (std::getenv("VIDBAR_DEBUG"))
-			std::cerr << fmt::format("[dbg] frame={} strips={} extract={} bytes={}",
-				frames, strips, stripRes, decodedBytes) << std::endl;
+			std::cerr << fmt::format("[dbg] frame={} strips={} prefer={} extract={} bytes={}",
+				frames, strips, layoutPrefer, frameGood, decodedBytes) << std::endl;
 
 		// 信号锁定判定（带迟滞）：
 		//   成为锁定：必须解出过数据帧（蓝屏/无信号画面骗不过解码器）；
@@ -320,8 +381,9 @@ int main(int argc, char** argv)
 			string progress;
 			for (double p : sink.get_progress())
 				progress += (progress.empty() ? "" : ",") + fmt::format("{:.3f}", p);
-			emit(fmt::format(R"({{"ev":"stat","frames":{},"decoded":{},"saved":{},"readfps":{:.1f},"streams":{},"progress":[{}]}})",
-				frames, decoded, *savedCount, frames / (secs > 0 ? secs : 1), sink.num_streams(), progress));
+			emit(fmt::format(R"({{"ev":"stat","frames":{},"decoded":{},"saved":{},"readfps":{:.1f},"streams":{},"progress":[{}],"prefer":{},"sext":{},"sdec":{},"fext":{},"fdec":{}}})",
+				frames, decoded, *savedCount, frames / (secs > 0 ? secs : 1), sink.num_streams(), progress,
+				layoutPrefer, stripExtOk, stripDecOk, fullExtOk, fullDecOk));
 		}
 	}
 

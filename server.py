@@ -115,7 +115,8 @@ class Server:
         self.shutdown = threading.Event()
         self._restart_at: float | None = None
         self._restart_times: list[float] = []
-        self._last_status = ""
+        self._last_stat: dict = {}
+        self._last_stat_print = 0.0
         self._t0 = time.time()
 
     # ---------- 主循环 ----------
@@ -160,7 +161,6 @@ class Server:
                 self._spawn_receiver()
 
             self._pump_output()
-            self._print_status()
             time.sleep(0.05)
 
         self._kill_receiver()
@@ -262,6 +262,7 @@ class Server:
             self._on_saved(Path(ev["path"]))
         elif kind == "stat":
             self._last_stat = ev
+            self._print_stat(ev)
         elif kind == "error":
             print(f"[!] vidbar_recv: {ev.get('msg')}")
 
@@ -291,7 +292,7 @@ class Server:
             sess = self.sessions.get(sid)
             if sess is None:
                 # manifest 还没到（服务端中途加入），先留在暂存目录等 manifest
-                self._touch_status(f"分片 {name} 已收到（等待 manifest）")
+                print(f"[*] 分片 {name} 已收到（等待 manifest）")
                 return
             if sess.on_chunk_file(path):
                 self._check_complete(sess)
@@ -348,7 +349,6 @@ class Server:
         common.clean_staging(self.staging_dir, sess.sid)
         if self.args.source is None:  # 视频文件模式让接收器自然播完退出
             self._restart_at = time.time() + RESTART_DELAY_AFTER_ASSEMBLY
-        self._last_status = ""
 
     # ---------- 恢复与状态 ----------
 
@@ -363,36 +363,22 @@ class Server:
             sess.adopt_existing()
             self._check_complete(sess)
 
-    def _touch_status(self, msg: str) -> None:
-        self._last_status = msg
+    def _print_stat(self, ev: dict) -> None:
+        """换行打印解码诊断（\r 原地刷新在 PowerShell 里既不显眼也没法复制反馈）。"""
+        now = time.time()
+        if now - self._last_stat_print < 8:
+            return
+        self._last_stat_print = now
 
-    def _print_status(self) -> None:
-        stat = getattr(self, "_last_stat", None) or {}
-        parts = []
-        if stat:
-            parts.append(f"帧 {stat.get('frames', 0)}")
-            if stat.get("readfps"):
-                parts.append(f"{stat['readfps']:.0f}fps")
-            # 码流布局诊断：prefer(1=条带 2=整帧) 及各管线 提角点/解码 成功帧数
-            prefer = stat.get("prefer")
-            if prefer is not None:
-                layout = {1: "条带", 2: "整帧"}.get(prefer, "探测中")
-                sext, sdec = stat.get("sext", 0), stat.get("sdec", 0)
-                fext, fdec = stat.get("fext", 0), stat.get("fdec", 0)
-                parts.append(f"布局:{layout} 条带提角{sext}/解出{sdec} 整帧提角{fext}/解出{fdec}")
-            prog = stat.get("progress") or []
-            if prog:
-                parts.append("流进度 " + ",".join(f"{p * 100:.0f}%" for p in prog))
-        if self.sessions:
-            active = [s for s in self.sessions.values() if not s.reported]
-            if active:
-                s = active[0]
-                parts.append(f"{s.manifest.filename} {len(s.chunks)}/{len(s.manifest.chunks)} 片")
-        line = " | ".join(parts)
-        if line and line != self._last_status:
-            sys.stdout.write("\r" + line.ljust(70))
-            sys.stdout.flush()
-            self._last_status = line
+        prefer = ev.get("prefer")
+        layout = {1: "条带", 2: "整帧"}.get(prefer, "探测中")
+        prog = ev.get("progress") or []
+        prog_s = ",".join(f"{p * 100:.0f}%" for p in prog) or "-"
+        mins = int((now - self._t0) // 60)
+        print(f"[诊断 {mins:02d}m] 帧数={ev.get('frames', 0)} 实际采集={ev.get('readfps', 0):.0f}fps "
+              f"布局={layout} 条带(提角/解出)={ev.get('sext', 0)}/{ev.get('sdec', 0)} "
+              f"整帧(提角/解出)={ev.get('fext', 0)}/{ev.get('fdec', 0)} "
+              f"码流数={ev.get('streams', 0)} 进度={prog_s}")
 
 
 def list_devices(args) -> None:

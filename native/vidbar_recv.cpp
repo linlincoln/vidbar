@@ -136,6 +136,9 @@ int main(int argc, char** argv)
 		("m,mode", "cimbar mode [B,Bm,Bu,4C]", cxxopts::value<string>()->default_value("B"))
 		("c,ccm", "Color correction mode (2=auto header-based, 0=off)", cxxopts::value<int>()->default_value("2"))
 		("s,stats", "Print a stat event every N frames (0 = off)", cxxopts::value<unsigned>()->default_value("120"))
+		("split", "Split each frame into N vertical strips, decoding one code per strip "
+		          "(2 = two side-by-side windows on ONE captured screen, for x2 throughput)",
+			cxxopts::value<unsigned>()->default_value("1"))
 		("h,help", "Print usage")
 	;
 	options.parse_positional({"in", "out"});
@@ -157,6 +160,12 @@ int main(int argc, char** argv)
 	unsigned wantFps = result["fps"].as<unsigned>();
 	unsigned statsEvery = result["stats"].as<unsigned>();
 	int colorCorrection = result["ccm"].as<int>();
+	unsigned strips = result["split"].as<unsigned>();
+	if (strips < 1 or strips > 4)
+	{
+		emit(R"({"ev":"error","msg":"--split must be 1..4"})");
+		return 64;
+	}
 
 	cimbar::Config::update(parse_mode(result["mode"].as<string>()));
 
@@ -203,15 +212,22 @@ int main(int argc, char** argv)
 		fcStr += (c >= 0x20 and c <= 0x7e) ? c : '?';
 	}
 
-	emit(fmt::format(R"({{"ev":"open","source":"{}","device":{},"w":{},"h":{},"fps":{},"fourcc":"{}"}})",
-		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr)));
+	emit(fmt::format(R"({{"ev":"open","source":"{}","device":{},"w":{},"h":{},"fps":{},"fourcc":"{}","split":{}}})",
+		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr), strips));
 
 	unsigned chunkSize = cimbar::Config::fountain_chunk_size();
 	auto savedCount = std::make_shared<uint64_t>(0);
+	// 一个 sink 收所有流：分片头部带 encode_id，双窗口两条码流天然互不混淆。
 	fountain_decoder_sink sink(chunkSize, make_store(outdir, savedCount));
 
-	Extractor ext;
-	Decoder dec;
+	// 每个竖条一条独立解码管线（角点跟踪/色彩校正等有状态，不能共享）。
+	vector<std::unique_ptr<Extractor>> exts;
+	vector<std::unique_ptr<Decoder>> decs;
+	for (unsigned i = 0; i < strips; ++i)
+	{
+		exts.emplace_back(new Extractor());
+		decs.emplace_back(new Decoder());
+	}
 
 	cv::Mat mat;
 	uint64_t frames = 0, decoded = 0;
@@ -242,22 +258,40 @@ int main(int argc, char** argv)
 
 		cv::UMat img = mat.getUMat(cv::ACCESS_RW).clone();
 
+		// --split N：一帧竖切 N 条，每条独立提角点+解码（同屏双码流）。
 		bool frameGood = false;
-		bool shouldPreprocess = false;
 		int decodedBytes = 0;
-		int res = ext.extract(img, img);
-		if (res)
+		int stripRes = 0;
+		for (unsigned s = 0; s < strips; ++s)
 		{
+			cv::UMat out;
+			int res = 0;
+			if (strips == 1)
+			{
+				res = exts[s]->extract(img, out);
+			}
+			else
+			{
+				int x0 = static_cast<int>(static_cast<long long>(mat.cols) * s / strips);
+				int x1 = static_cast<int>(static_cast<long long>(mat.cols) * (s + 1) / strips);
+				cv::UMat strip = img(cv::Rect(x0, 0, x1 - x0, mat.rows));
+				res = exts[s]->extract(strip, out);
+			}
+			if (!res)
+				continue;
 			frameGood = true;
-			if (res == Extractor::NEEDS_SHARPEN)
-				shouldPreprocess = true;
-
-			decodedBytes = dec.decode_fountain(img, sink, shouldPreprocess, colorCorrection);
-			if (decodedBytes > 0)
+			stripRes |= res;
+			bool shouldPreprocess = (res == Extractor::NEEDS_SHARPEN);
+			int nbytes = decs[s]->decode_fountain(out, sink, shouldPreprocess, colorCorrection);
+			if (nbytes > 0)
+			{
 				++decoded;
+				decodedBytes += nbytes;
+			}
 		}
 		if (std::getenv("VIDBAR_DEBUG"))
-			std::cerr << fmt::format("[dbg] frame={} extract={} bytes={}", frames, res, decodedBytes) << std::endl;
+			std::cerr << fmt::format("[dbg] frame={} strips={} extract={} bytes={}",
+				frames, strips, stripRes, decodedBytes) << std::endl;
 
 		// 信号锁定判定（带迟滞）：
 		//   成为锁定：必须解出过数据帧（蓝屏/无信号画面骗不过解码器）；

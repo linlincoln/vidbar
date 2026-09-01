@@ -40,9 +40,10 @@ ROUND_CHOICES = {"1 轮（最快，要求服务端从头接收）": 1,
                  "3 轮（最稳）": 3,
                  "无限循环（手动停止）": 0}
 REDUNDANCY_CHOICES = {"快速 1.3x": 1.3, "标准 1.6x": 1.6, "保守 2.2x": 2.2}
-# 窗口模式：双窗口时一个任务开两个播放进程，分片交错分配（窗口A: 偶数片,
-# 窗口B: 奇数片），各放一块被采集的屏幕上，理论速度翻倍（需两块采集卡）。
-WINDOW_MODE_CHOICES = {"单窗口": 1, "双窗口加速（x2，需两块采集屏）": 2}
+# 窗口模式：双窗口时一个任务在同一块屏上左右并排开两个播放进程，
+# 分片交错分配（窗口A: 偶数片, 窗口B: 奇数片），一张采集卡同帧解两路，
+# 理论速度翻倍（接收端需以 --split 2 启动）。
+WINDOW_MODE_CHOICES = {"单窗口": 1, "双窗口加速（x2，同屏双码流）": 2}
 
 ROUND_FILE_RE = re.compile(r"round (\d+) file (\d+) \((.*?)\): (\d+) frames")
 MONITOR_RE = re.compile(r"monitor (\d+): (\d+)x(\d+) \+(-?\d+)\+(-?\d+)")
@@ -154,8 +155,9 @@ class TransferJob(threading.Thread):
         base = int(sid[:2], 16) & 0x7F
         try:
             if nwin == 2:
-                # 双窗口：同屏左右并排，分片交错分配（A: 偶数片, B: 奇数片）。
+                # 双窗口：同一块屏左右并排，分片交错分配（A: 偶数片, B: 奇数片）。
                 # manifest 走窗口A；encode_id 偏移 64 避让两条流。
+                app.emit("注意：接收端需以 python server.py --split 2 启动（同帧双码流）")
                 files_a = [str(manifest_path)] + [str(p) for p in chunk_paths[0::2]]
                 files_b = [str(p) for p in chunk_paths[1::2]]
                 mon = app.monitor_a
@@ -269,8 +271,8 @@ class ClientApp:
 
         row3 = ttk.Frame(settings)
         row3.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row3, text="（大文件建议 8~32MB；双窗口=同一块屏左右并排两个播放窗口，"
-                             "分片交错各传一半，速度约 x2）").pack(side="left")
+        ttk.Label(row3, text="（大文件建议 8~32MB；双窗口=同一块屏上左右并排两个播放窗口，"
+                             "分片交错各传一半；接收端需加 --split 2，速度约 x2）").pack(side="left")
 
         status = ttk.LabelFrame(self.win, text="状态")
         status.pack(fill="x", **pad)
@@ -286,7 +288,8 @@ class ClientApp:
         self.stop_btn = ttk.Button(btns, text="停止", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=8)
 
-        self.notice = ("提示：播放窗口会自动放到所选屏幕（双窗口=该屏左右并排两个窗口）。"
+        self.notice = ("提示：播放窗口会自动放到所选屏幕（双窗口=该屏左右并排两个窗口，"
+                       "接收端需以 python server.py --split 2 启动）。"
                        "请确认该屏幕正被 HDMI 采集，且窗口不被遮挡。")
         ttk.Label(self.win, text=self.notice, foreground="#666").pack(fill="x", **pad)
 

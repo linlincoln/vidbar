@@ -133,7 +133,8 @@ class Server:
         print(f"暂存目录: {self.staging_dir}")
         print(f"设备: {self.args.device} | 后端: {self.args.api} | "
               f"请求: {self.args.width}x{self.args.height} @ {self.args.fps or '默认'}fps "
-              f"({self.args.fourcc})")
+              f"({self.args.fourcc})"
+              + (f" | 同帧 {self.args.split} 码流" if self.args.split > 1 else ""))
         print("等待信号...（Ctrl+C 退出）")
 
         while not self.shutdown.is_set():
@@ -174,6 +175,8 @@ class Server:
                "-s", "60"]
         if self.args.fps:
             cmd += ["-F", str(self.args.fps)]
+        if self.args.split > 1:
+            cmd += ["--split", str(self.args.split)]
         if self.args.mode:
             cmd += ["-m", self.args.mode]
         if self.args.source:  # 回环测试：视频文件代替设备
@@ -431,6 +434,8 @@ def main() -> None:
     ap.add_argument("-F", "--fps", type=int, default=60 if IS_WIN else 30,
                     help="请求采集帧率（0=不设置，默认 Windows 60 / 其他 30）")
     ap.add_argument("-m", "--mode", default="B", help="cimbar 模式（默认 B）")
+    ap.add_argument("--split", type=int, default=1, choices=[1, 2, 3, 4],
+                    help="同帧竖切几条码流（客户端双窗口同屏模式用 2，速度约 x2）")
     ap.add_argument("--staging", default=None, help="暂存目录（默认 <输出>/.vidtx-staging）")
     ap.add_argument("--list-devices", action="store_true", help="列出可用采集设备后退出")
     args = ap.parse_args()

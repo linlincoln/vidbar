@@ -88,6 +88,78 @@ def run_one_case(src: Path, workdir: Path, fps: int, rounds: int,
     return True
 
 
+def run_dual_case(src: Path, workdir: Path, fps: int, rounds: int,
+                  redundancy: float, chunk_mb: int, timeout: int = 1800) -> bool:
+    """同屏双码流回环：窗口A/B 各渲染一段视频，水平拼接成一个画面后以 --split 2 解码。"""
+    sid = common.new_sid()
+    staging = workdir / "chunks"
+    outdir = workdir / "received"
+
+    t0 = time.time()
+    print(f"[1/5] 分片: {src.name} ({common.human_size(src.stat().st_size)})")
+    manifest, chunk_paths = common.split_file(src, staging, sid, chunk_mb=chunk_mb)
+    manifest_path = staging / common.manifest_name(sid)
+    manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+    print(f"     sid={sid}，{len(chunk_paths)} 个分片")
+
+    files_a = [str(manifest_path)] + [str(p) for p in chunk_paths[0::2]]
+    files_b = [str(p) for p in chunk_paths[1::2]]
+    if not files_b:
+        print("[!] 分片数不足以拆两路，请用更小的 --chunk-mb 重试")
+        return False
+    base = int(sid[:2], 16) & 0x7F
+
+    print(f"[2/5] 分别渲染窗口A/B 视频（{fps}fps，{rounds or '∞'} 轮，冗余 {redundancy}x）")
+    videos = []
+    for tag, files, bid in (("A", files_a, base), ("B", files_b, (base + 64) & 0x7F)):
+        video = workdir / f"loop_{tag}.avi"
+        cmd = [str(SENDER), "-o", str(video), "-f", str(fps), "-r", str(rounds),
+               "-R", str(redundancy), "-b", str(bid)] + files
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0 or not video.exists():
+            print(f"[!] vidbar_send（窗口{tag}）失败: {p.stderr[-500:]}")
+            return False
+        videos.append(video)
+        print(f"     窗口{tag}: {video.name} ({common.human_size(video.stat().st_size)})")
+
+    print("[3/5] 水平拼接为同屏双码流画面")
+    combined = workdir / "loop_dual.avi"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-i", str(videos[0]), "-i", str(videos[1]),
+           "-filter_complex", "[0:v][1:v]hstack=inputs=2",
+           "-c:v", "mjpeg", "-q:v", "3", str(combined)]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0 or not combined.exists():
+        print(f"[!] ffmpeg 拼接失败: {p.stderr[-500:]}")
+        return False
+
+    print("[4/5] 启动 server.py --split 2 从合成画面解码")
+    t1 = time.time()
+    srv = subprocess.run(
+        [sys.executable, str(ROOT / "server.py"),
+         "--source", str(combined), "-o", str(outdir), "--split", "2"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=timeout)
+    print(srv.stdout)
+    if srv.returncode != 0:
+        print(f"[!] server.py 异常退出: {srv.stderr[-800:]}")
+
+    print("[5/5] 校验结果")
+    dest = outdir / common.sanitize_filename(src.name)
+    if not dest.exists():
+        print(f"[✗] 未收到文件: {dest}")
+        return False
+    got = common.sha256_file(dest)
+    want = common.sha256_file(src)
+    dt = time.time() - t1
+    if got != want:
+        print(f"[✗] sha256 不一致!\n     期望 {want}\n     实际 {got}")
+        return False
+    speed = src.stat().st_size / dt
+    print(f"[✓] 双码流回环测试通过: {src.name} {common.human_size(src.stat().st_size)} "
+          f"sha256 一致 · 解码耗时 {dt:.1f}s · 平均 {common.human_size(int(speed))}/s")
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="vidtx 回环集成测试")
     ap.add_argument("target", nargs="?", default=None,
@@ -96,6 +168,8 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--redundancy", type=float, default=1.6)
     ap.add_argument("--chunk-mb", type=int, default=1)
+    ap.add_argument("--dual", action="store_true",
+                    help="同屏双码流模式：渲染左右两路拼成一个画面，以 --split 2 解码")
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
     args = ap.parse_args()
 
@@ -121,8 +195,12 @@ def main() -> None:
                     f.write(os.urandom(n))
                     left -= n
 
-        ok = run_one_case(src, workdir, args.fps, args.rounds,
-                          args.redundancy, args.chunk_mb)
+        if args.dual:
+            ok = run_dual_case(src, workdir, args.fps, args.rounds,
+                               args.redundancy, args.chunk_mb)
+        else:
+            ok = run_one_case(src, workdir, args.fps, args.rounds,
+                              args.redundancy, args.chunk_mb)
         sys.exit(0 if ok else 1)
     finally:
         if args.keep:

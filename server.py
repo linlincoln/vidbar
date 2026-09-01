@@ -48,6 +48,7 @@ class Session:
         self.chunks: dict[str, Path] = {}      # name -> 已校验的分片路径
         self.first_seen = time.time()
         self.reported = False
+        self.needs_restart = False             # 有分片校验失败，需要重启接收器
 
     @property
     def sid(self) -> str:
@@ -79,6 +80,13 @@ class Session:
             self._report_progress()
         else:
             print(f"[!] 分片校验失败，丢弃等待重传: {path.name}")
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # 解码器已把该 (id,size) 流标记为完成，不会再接收同一分片；
+            # 标记需要重启接收器，才能接收客户端下一轮重传。
+            self.needs_restart = True
 
     def is_complete(self) -> bool:
         return len(self.chunks) == len(self.manifest.chunks)
@@ -252,7 +260,12 @@ class Server:
         if common.is_manifest_name(name):
             m = common.parse_manifest(path)
             if m is None:
-                print(f"[!] manifest 解析失败: {path}")
+                print(f"[!] manifest 解析失败（数据损坏），等待重传: {path}")
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._schedule_restart()
                 return
             sess = Session(m, self.staging_dir)
             self.sessions[m.sid] = sess
@@ -260,6 +273,9 @@ class Server:
                   f"（{common.human_size(m.size)}，{len(m.chunks)} 个分片）")
             sess.adopt_existing()
             self._check_complete(sess)
+            if sess.needs_restart:
+                sess.needs_restart = False
+                self._schedule_restart()
         elif common.sid_of(name):
             sid = common.sid_of(name)
             sess = self.sessions.get(sid)
@@ -269,11 +285,38 @@ class Server:
                 return
             if sess.on_chunk_file(path):
                 self._check_complete(sess)
+            if sess.needs_restart:
+                sess.needs_restart = False
+                self._schedule_restart()
         else:
-            # 非 vidtx 协议的普通 cimbar 文件，直接落盘
+            self._handle_stray(path)
+
+    def _handle_stray(self, path: Path) -> None:
+        """非 vidtx 协议的普通 cimbar 文件，或文件名损坏的 vidtx 分片。"""
+        name = path.name
+        if name.startswith("vt_"):
+            # vidtx 分片名必然匹配 vt_<hex sid>_NNN / vt_<hex sid>_manifest.json。
+            # 带着损坏名字落盘说明解码数据出错（zstd 头被误码破坏）。
+            print(f"[!] 损坏的 vidtx 分片（文件名异常），丢弃等待重传: {name!r}")
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._schedule_restart()
+            return
+        try:
             dest = common.unique_dest(self.output_dir / common.sanitize_filename(name))
             shutil.move(str(path), dest)
             print(f"[✓] 已保存: {dest}")
+        except OSError as e:
+            print(f"[!] 保存失败（忽略）: {name!r}: {e}")
+
+    def _schedule_restart(self, delay: float = 1.0) -> None:
+        """请求重启接收器：解码器对已完成的流不会重收，损坏数据需清除状态后重传。"""
+        if self.args.source is not None:  # 视频文件模式自然播完退出，不重启
+            return
+        if self._restart_at is None:
+            self._restart_at = time.time() + delay
 
     def _check_complete(self, sess: Session) -> None:
         if not sess.is_complete() or sess.reported:

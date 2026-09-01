@@ -76,6 +76,13 @@ std::function<std::string(const std::string&, const std::vector<uint8_t>&)> make
 		if (filename.empty())
 			filename = fallback_name;
 
+		// 文件名里出现非可打印 ASCII 字节说明解码数据出错（zstd 头被误码破坏）。
+		// 清洗成 '_' 保证磁盘文件名与 JSON 事件里的路径完全一致——否则
+		// server 侧按 UTF-8 替换解码后路径对不上，move 时 FileNotFoundError。
+		for (char& c : filename)
+			if (static_cast<unsigned char>(c) < 0x20 or static_cast<unsigned char>(c) > 0x7e)
+				c = '_';
+
 		string file_path = fmt::format("{}/{}", outdir, filename);
 		{
 			cimbar::zstd_decompressor<std::ofstream> f(file_path, std::ios::binary);

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -55,6 +56,20 @@ unsigned parse_mode(const string& mode)
 	return 68; // B
 }
 
+// 解析 "WxH"（如 950x950）；失败返回 false
+bool parse_size(const string& s, unsigned& w, unsigned& h)
+{
+	char x = 0;
+	return std::sscanf(s.c_str(), "%ux%u%c", &w, &h, &x) == 2 and w > 0 and h > 0;
+}
+
+// 解析 "X,Y"（如 0,0）；失败返回 false
+bool parse_pos(const string& s, int& x, int& y)
+{
+	char c = 0;
+	return std::sscanf(s.c_str(), "%d,%d%c", &x, &y, &c) == 2;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -71,6 +86,8 @@ int main(int argc, char** argv)
 		("m,mode", "cimbar mode [B,Bm,Bu,4C]", cxxopts::value<string>()->default_value("B"))
 		("z,compression", "zstd compression level. 0 == none", cxxopts::value<int>()->default_value(turbo::str::str(compressionLevel)))
 		("p,padding", "Black padding around image in pixels", cxxopts::value<unsigned>()->default_value("32"))
+		("win", "Window size WxH, e.g. 950x950 (default: fit code, clamped to screen to avoid taskbar overlap)", cxxopts::value<string>())
+		("pos", "Window position X,Y, e.g. 0,0 (default: 0,0 top-left; combine with --win for side-by-side runs)", cxxopts::value<string>())
 		("o,out", "Output MJPEG video file (headless mode: no window, for loopback testing)", cxxopts::value<string>())
 		("h,help", "Print usage")
 	;
@@ -145,11 +162,43 @@ int main(int argc, char** argv)
 	}
 
 	// ---------- 窗口模式：GLFW 播放窗口 ----------
-	// 与上游 cimbar_send 一致：高 DPI 下按显示器缩放窗口
-	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+	// 注意：不启用 GLFW_SCALE_TO_MONITOR。高 DPI（125%/150%）下它会把窗口
+	// 放大到超出屏幕、底部被任务栏遮挡——恰好盖住 cimbar 的四角锚点。
 
 	unsigned winX = cimbar::Config::image_size_x() + 16;
 	unsigned winY = cimbar::Config::image_size_y() + 16;
+	unsigned userW = 0, userH = 0;
+	if (result.count("win"))
+	{
+		if (!parse_size(result["win"].as<string>(), userW, userH))
+		{
+			std::cerr << "bad --win format, expected WxH like 950x950" << std::endl;
+			return 71;
+		}
+		winX = userW;
+		winY = userH;
+	}
+	else if (glfwInit() == GLFW_TRUE)
+	{
+		// 默认自适应屏幕：预留任务栏高度，保证四角锚点完整可见
+		// （glfwInit 幂等，window_glfw 构造时会再次调用，引用计数平衡）
+		if (const GLFWvidmode* vm = glfwGetVideoMode(glfwGetPrimaryMonitor()))
+		{
+			winX = std::min(winX, static_cast<unsigned>(vm->width > 16 ? vm->width - 16 : 0));
+			winY = std::min(winY, static_cast<unsigned>(vm->height > 80 ? vm->height - 80 : 0));
+		}
+	}
+
+	int posX = 0, posY = 0;
+	if (result.count("pos"))
+	{
+		if (!parse_pos(result["pos"].as<string>(), posX, posY))
+		{
+			std::cerr << "bad --pos format, expected X,Y like 100,50" << std::endl;
+			return 71;
+		}
+	}
+
 	cimbar::window_glfw window(winX, winY, "vidtx player - drag onto captured screen");
 	if (!window.is_good())
 	{
@@ -157,6 +206,7 @@ int main(int argc, char** argv)
 		return 70;
 	}
 	window.auto_scale_to_window(padding);
+	window.set_pos(posX, posY);
 
 	EncoderPlus enc;
 	unsigned round = 0;

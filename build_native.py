@@ -78,6 +78,13 @@ def inject_vidbar_recv() -> None:
         shutil.copyfile(zstd_patch, dst)
         print("[+] 已注入 zstd_compressor.h 补丁（随机填充修复小文件解码）")
 
+    # 覆盖上游 window_glfw.h：增加 set_pos()（vidbar_send --pos 需要）。
+    win_patch = NATIVE_DIR / "window_glfw.h"
+    if win_patch.exists():
+        dst = SRC_TREE / "src" / "lib" / "gui" / "window_glfw.h"
+        shutil.copyfile(win_patch, dst)
+        print("[+] 已注入 window_glfw.h 补丁（新增 set_pos）")
+
     root_cmake = SRC_TREE / "CMakeLists.txt"
     text = root_cmake.read_text(encoding="utf-8")
     changed = False

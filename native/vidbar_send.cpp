@@ -87,7 +87,9 @@ int main(int argc, char** argv)
 		("z,compression", "zstd compression level. 0 == none", cxxopts::value<int>()->default_value(turbo::str::str(compressionLevel)))
 		("p,padding", "Black padding around image in pixels", cxxopts::value<unsigned>()->default_value("32"))
 		("win", "Window size WxH, e.g. 950x950 (default: fit code, clamped to screen to avoid taskbar overlap)", cxxopts::value<string>())
-		("pos", "Window position X,Y, e.g. 0,0 (default: 0,0 top-left; combine with --win for side-by-side runs)", cxxopts::value<string>())
+		("pos", "Window position X,Y, e.g. 0,0 (default: monitor top-left)", cxxopts::value<string>())
+		("monitor", "Monitor index to place window on, 1-based (0 = primary)", cxxopts::value<int>()->default_value("0"))
+		("list-monitors", "List available monitors and exit")
 		("o,out", "Output MJPEG video file (headless mode: no window, for loopback testing)", cxxopts::value<string>())
 		("h,help", "Print usage")
 	;
@@ -96,6 +98,26 @@ int main(int argc, char** argv)
 	options.positional_help("<in...>");
 
 	auto result = options.parse(argc, argv);
+	if (result.count("list-monitors"))
+	{
+		if (glfwInit() == GLFW_TRUE)
+		{
+			int count = 0;
+			GLFWmonitor** mons = glfwGetMonitors(&count);
+			for (int i = 0; i < count; ++i)
+			{
+				const GLFWvidmode* vm = glfwGetVideoMode(mons[i]);
+				int mx = 0, my = 0;
+				glfwGetMonitorPos(mons[i], &mx, &my);
+				const char* name = glfwGetMonitorName(mons[i]);
+				if (vm)
+					std::cout << "monitor " << (i + 1) << ": " << vm->width << "x" << vm->height
+						<< " +" << mx << "+" << my << " " << (name ? name : "") << std::endl;
+			}
+		}
+		return 0;
+	}
+
 	if (result.count("help") or !result.count("in"))
 	{
 		std::cout << options.help() << std::endl;
@@ -165,11 +187,40 @@ int main(int argc, char** argv)
 	// 注意：不启用 GLFW_SCALE_TO_MONITOR。高 DPI（125%/150%）下它会把窗口
 	// 放大到超出屏幕、底部被任务栏遮挡——恰好盖住 cimbar 的四角锚点。
 
+	if (glfwInit() != GLFW_TRUE)
+	{
+		std::cerr << "failed to init glfw :(" << std::endl;
+		return 70;
+	}
+
+	// 目标显示器：--monitor N（1 起）；未指定时用主显示器
+	int monitorIdx = result["monitor"].as<int>();
+	GLFWmonitor* target = nullptr;
+	{
+		int count = 0;
+		GLFWmonitor** mons = glfwGetMonitors(&count);
+		if (monitorIdx >= 1 and monitorIdx <= count)
+			target = mons[monitorIdx - 1];
+		else if (count > 0)
+			target = mons[0]; // GLFW 保证第一个是主显示器
+	}
+	int monX = 0, monY = 0;
+	unsigned monW = 1920, monH = 1080;
+	if (target)
+	{
+		if (const GLFWvidmode* vm = glfwGetVideoMode(target))
+		{
+			monW = vm->width;
+			monH = vm->height;
+			glfwGetMonitorPos(target, &monX, &monY);
+		}
+	}
+
 	unsigned winX = cimbar::Config::image_size_x() + 16;
 	unsigned winY = cimbar::Config::image_size_y() + 16;
-	unsigned userW = 0, userH = 0;
 	if (result.count("win"))
 	{
+		unsigned userW = 0, userH = 0;
 		if (!parse_size(result["win"].as<string>(), userW, userH))
 		{
 			std::cerr << "bad --win format, expected WxH like 950x950" << std::endl;
@@ -178,18 +229,15 @@ int main(int argc, char** argv)
 		winX = userW;
 		winY = userH;
 	}
-	else if (glfwInit() == GLFW_TRUE)
+	else
 	{
-		// 默认自适应屏幕：预留任务栏高度，保证四角锚点完整可见
+		// 默认在目标显示器内自适应：预留任务栏高度，保证四角锚点完整可见
 		// （glfwInit 幂等，window_glfw 构造时会再次调用，引用计数平衡）
-		if (const GLFWvidmode* vm = glfwGetVideoMode(glfwGetPrimaryMonitor()))
-		{
-			winX = std::min(winX, static_cast<unsigned>(vm->width > 16 ? vm->width - 16 : 0));
-			winY = std::min(winY, static_cast<unsigned>(vm->height > 80 ? vm->height - 80 : 0));
-		}
+		winX = std::min(winX, monW > 16 ? monW - 16 : 0);
+		winY = std::min(winY, monH > 80 ? monH - 80 : 0);
 	}
 
-	int posX = 0, posY = 0;
+	int posX = monX, posY = monY;  // 默认放在目标显示器左上角
 	if (result.count("pos"))
 	{
 		if (!parse_pos(result["pos"].as<string>(), posX, posY))

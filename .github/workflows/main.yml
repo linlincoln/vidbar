@@ -10,7 +10,7 @@ on:
     paths:
       - native/**
       - build_native.py
-      - .github/workflows/build-windows.yml
+      - .github/workflows/main.yml
 
 jobs:
   build:
@@ -18,15 +18,15 @@ jobs:
     timeout-minutes: 240         # 首次构建 opencv+angle 约 1~2 小时，缓存命中后约 10 分钟
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       # vcpkg 二进制缓存：让第二次起构建不必重编依赖
       - name: vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
           key: vidtx-vcpkg-binaries-v1

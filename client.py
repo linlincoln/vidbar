@@ -40,23 +40,77 @@ ROUND_CHOICES = {"1 轮（最快，要求服务端从头接收）": 1,
                  "3 轮（最稳）": 3,
                  "无限循环（手动停止）": 0}
 REDUNDANCY_CHOICES = {"快速 1.3x": 1.3, "标准 1.6x": 1.6, "保守 2.2x": 2.2}
-# 窗口布局：双开时两个客户端分别选左/右半屏，播放窗口并排互不遮挡。
-# 窗口尺寸取屏幕一半再留边，码图约 0.9x 缩放，对解码影响很小。
-LAYOUT_CHOICES = {"自动（单开，自动避开任务栏）": None,
-                  "左半屏（双开-左）": "left",
-                  "右半屏（双开-右）": "right"}
+# 窗口模式：双窗口时一个任务开两个播放进程，分片交错分配（窗口A: 偶数片,
+# 窗口B: 奇数片），各放一块被采集的屏幕上，理论速度翻倍（需两块采集卡）。
+WINDOW_MODE_CHOICES = {"单窗口": 1, "双窗口加速（x2，需两块采集屏）": 2}
 
 ROUND_FILE_RE = re.compile(r"round (\d+) file (\d+) \((.*?)\): (\d+) frames")
+MONITOR_RE = re.compile(r"monitor (\d+): (\d+)x(\d+) \+(-?\d+)\+(-?\d+)")
+
+
+def list_monitors() -> list[tuple[int, int, int]]:
+    """向 vidbar_send --list-monitors 查询可用屏幕，返回 [(序号, 宽, 高), ...]。"""
+    try:
+        p = subprocess.run([str(SENDER), "--list-monitors"], capture_output=True,
+                           text=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0)
+        mons = [(int(m[1]), int(m[2]), int(m[3]))
+                for m in (MONITOR_RE.match(l.strip()) for l in p.stdout.splitlines()) if m]
+        if mons:
+            return mons
+    except Exception:
+        pass
+    return [(1, 0, 0)]  # 探测失败：假装只有一块屏，不传 --monitor（兼容旧二进制）
+
+
+def monitor_labels(mons: list[tuple[int, int, int]]) -> dict[str, int]:
+    """'屏幕2 (1920x1080)' -> 2"""
+    return {f"屏幕{idx}（{w}x{h}）" if w else f"屏幕{idx}": idx
+            for idx, w, h in mons}
 
 
 class TransferJob(threading.Thread):
-    """后台线程：分片 -> 启动 vidbar_send -> 转发 stderr 进度。"""
+    """后台线程：分片 -> 启动 1~2 个 vidbar_send -> 转发 stderr 进度。"""
 
     def __init__(self, app: "ClientApp"):
         super().__init__(daemon=True)
         self.app = app
         self.stop_flag = threading.Event()
-        self.proc: subprocess.Popen | None = None
+        self.procs: list[subprocess.Popen] = []
+
+    def _spawn(self, files: list[str], base: int, monitor: int,
+               win: str | None = None, pos: str | None = None) -> subprocess.Popen:
+        app = self.app
+        cmd = [str(SENDER), "-f", str(app.fps), "-r", str(app.rounds),
+               "-R", str(app.redundancy), "-b", str(base)]
+        if monitor > 0:
+            cmd += ["--monitor", str(monitor)]
+        if win:
+            cmd += ["--win", win]
+        if pos:
+            cmd += ["--pos", pos]
+        cmd += files
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0)
+        self.procs.append(proc)
+        return proc
+
+    def _reader(self, proc: subprocess.Popen, tag: str) -> None:
+        """读一个 vidbar_send 的 stderr，转发进度。"""
+        app = self.app
+        for line in proc.stderr:  # 阻塞读，进程结束即 EOF
+            line = line.strip()
+            if not line:
+                continue
+            m = ROUND_FILE_RE.search(line)
+            if m:
+                rnd, idx, name, frames = int(m[1]), int(m[2]), m[3], int(m[4])
+                app.on_chunk_done(rnd, idx, name, frames)
+            app.emit(f"{tag} {line}" if tag else line)
+        code = proc.wait()
+        app.emit(f"vidbar_send{tag} 退出，code={code}")
 
     def run(self) -> None:
         app = self.app
@@ -83,65 +137,65 @@ class TransferJob(threading.Thread):
         manifest_path = staging / common.manifest_name(sid)
         manifest_path.write_text(manifest.to_json(), encoding="utf-8")
 
-        files = [str(manifest_path)] + [str(p) for p in chunk_paths]
-        total_frames = sum(c["size"] / common.BYTES_PER_FRAME for c in manifest.chunks)
+        self.n_chunks = len(chunk_paths)  # 供进度显示
         rounds = app.rounds
         redun = app.redundancy
         fps = app.fps
+        nwin = app.n_windows if len(chunk_paths) >= 2 else 1
+        if app.n_windows == 2 and nwin == 1:
+            app.emit("只有 1 个分片，双窗口退化为单窗口")
         est = common.estimate_total_seconds(Path(src).stat().st_size, fps, redun,
-                                            max(rounds, 1))
+                                            max(rounds, 1)) / nwin
         app.emit(f"共 {len(chunk_paths)} 个分片 + manifest，"
-                 f"帧率 {fps}，冗余 {redun}x，轮数 {rounds or '∞'}")
+                 f"帧率 {fps}，冗余 {redun}x，轮数 {rounds or '∞'}，"
+                 f"{'双窗口并行' if nwin == 2 else '单窗口'}")
         app.emit(f"预计传输用时约 {int(est // 60)} 分 {int(est % 60)} 秒（不含压缩时间）")
 
-        # ---- 启动 vidbar_send ----
         base = int(sid[:2], 16) & 0x7F
-        cmd = [str(SENDER), "-f", str(fps), "-r", str(rounds),
-               "-R", str(redun), "-b", str(base)]
-        if app.layout:  # 双开布局：固定窗口尺寸与位置，与另一侧并排
-            cmd += ["--win", f"{app.win_size}x{app.win_size}",
-                    "--pos", f"{app.win_pos[0]},{app.win_pos[1]}"]
-        cmd += files
-        app.emit("启动播放窗口，请把它拖到被采集的显示器上 ..." if not app.layout
-                 else f"播放窗口已定位到{'左' if app.layout == 'left' else '右'}半屏"
-                      f"（{app.win_size}x{app.win_size}）")
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE,
-                                         text=True, encoding="utf-8", errors="replace",
-                                         creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0)
+            if nwin == 2:
+                # 双窗口：同屏左右并排，分片交错分配（A: 偶数片, B: 奇数片）。
+                # manifest 走窗口A；encode_id 偏移 64 避让两条流。
+                files_a = [str(manifest_path)] + [str(p) for p in chunk_paths[0::2]]
+                files_b = [str(p) for p in chunk_paths[1::2]]
+                mon = app.monitor_a
+                w = max(512, min(app.mon_w // 2 - 16, app.mon_h - 80))
+                proc_a = self._spawn(files_a, base, mon,
+                                     win=f"{w}x{w}", pos="0,0")
+                proc_b = self._spawn(files_b, (base + 64) & 0x7F, mon,
+                                     win=f"{w}x{w}", pos=f"{app.mon_w - w - 8},0")
+                app.emit(f"窗口A pid={proc_a.pid}（左半屏 {w}x{w}），"
+                         f"窗口B pid={proc_b.pid}（右半屏 {w}x{w}）")
+                t_readers = [threading.Thread(target=self._reader, args=(p, t), daemon=True)
+                             for p, t in ((proc_a, "[A]"), (proc_b, "[B]"))]
+                for t in t_readers:
+                    t.start()
+                for t in t_readers:
+                    t.join()
+            else:
+                proc = self._spawn([str(manifest_path)] + [str(p) for p in chunk_paths],
+                                  base, app.monitor_a)
+                app.emit(f"vidbar_send pid={proc.pid}（屏幕{app.monitor_a or 1}）")
+                self._reader(proc, "")
         except OSError as e:
             app.emit(f"启动 vidbar_send 失败: {e}")
             app.finish()
             return
 
-        app.emit(f"vidbar_send pid={self.proc.pid}")
-        for line in self.proc.stderr:  # 阻塞读，进程结束即 EOF
-            line = line.strip()
-            if not line:
-                continue
-            m = ROUND_FILE_RE.search(line)
-            if m:
-                rnd, idx, name, frames = int(m[1]), int(m[2]), m[3], int(m[4])
-                app.on_chunk_done(rnd, idx, name, frames, total_frames,
-                                  len(chunk_paths), rounds)
-            app.emit(line)
-
-        code = self.proc.wait()
-        app.emit(f"vidbar_send 退出，code={code}")
         app.finish()
 
     def stop(self) -> None:
         self.stop_flag.set()
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
+        for proc in self.procs:
+            if proc.poll() is None:
                 try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            except OSError:
-                pass
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                except OSError:
+                    pass
 
 
 class ClientApp:
@@ -181,7 +235,15 @@ class ClientApp:
         self.rounds_var = tk.StringVar(value=list(ROUND_CHOICES)[1])
         self.redun_var = tk.StringVar(value=list(REDUNDANCY_CHOICES)[1])
         self.chunk_var = tk.StringVar(value=str(common.DEFAULT_CHUNK_MB))
-        self.layout_var = tk.StringVar(value=list(LAYOUT_CHOICES)[0])
+
+        # 探测屏幕（来自 vidbar_send --list-monitors）
+        self.monitors = list_monitors()
+        self.mon_labels = monitor_labels(self.monitors)
+        default_mon = list(self.mon_labels)[0]
+        if len(self.mon_labels) > 1:
+            default_mon = list(self.mon_labels)[1]  # 多屏默认第二块（通常是采集屏）
+        self.screen_var = tk.StringVar(value=default_mon)
+        self.mode_var = tk.StringVar(value=list(WINDOW_MODE_CHOICES)[0])
 
         row = ttk.Frame(settings)
         row.pack(fill="x", padx=8, pady=4)
@@ -198,14 +260,17 @@ class ClientApp:
         ttk.Label(row2, text="分片大小 (MB)").pack(side="left")
         ttk.Spinbox(row2, from_=common.MIN_CHUNK_MB, to=128, textvariable=self.chunk_var,
                     width=6).pack(side="left", padx=(2, 12))
-        ttk.Label(row2, text="窗口布局").pack(side="left")
-        ttk.Combobox(row2, textvariable=self.layout_var, values=list(LAYOUT_CHOICES),
+        ttk.Label(row2, text="屏幕").pack(side="left")
+        ttk.Combobox(row2, textvariable=self.screen_var, values=list(self.mon_labels),
+                     state="readonly", width=20).pack(side="left", padx=(2, 12))
+        ttk.Label(row2, text="窗口模式").pack(side="left")
+        ttk.Combobox(row2, textvariable=self.mode_var, values=list(WINDOW_MODE_CHOICES),
                      state="readonly", width=24).pack(side="left", padx=(2, 12))
-        ttk.Label(row2, text="（双开时两个客户端分别选左/右半屏）").pack(side="left")
 
         row3 = ttk.Frame(settings)
         row3.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row3, text="（大文件建议 8~32MB；分片越小，服务端中途加入恢复越快）").pack(side="left")
+        ttk.Label(row3, text="（大文件建议 8~32MB；双窗口=同一块屏左右并排两个播放窗口，"
+                             "分片交错各传一半，速度约 x2）").pack(side="left")
 
         status = ttk.LabelFrame(self.win, text="状态")
         status.pack(fill="x", **pad)
@@ -221,8 +286,8 @@ class ClientApp:
         self.stop_btn = ttk.Button(btns, text="停止", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=8)
 
-        self.notice = ("提示：开始后会弹出播放窗口（彩色噪点图案）。"
-                       "请将其拖到被 HDMI 采集的显示器上，位置任意，不要遮挡。")
+        self.notice = ("提示：播放窗口会自动放到所选屏幕（双窗口=该屏左右并排两个窗口）。"
+                       "请确认该屏幕正被 HDMI 采集，且窗口不被遮挡。")
         ttk.Label(self.win, text=self.notice, foreground="#666").pack(fill="x", **pad)
 
         logbox = ttk.LabelFrame(self.win, text="日志")
@@ -259,15 +324,16 @@ class ClientApp:
         self.fps = FPS_CHOICES[self.fps_var.get()]
         self.rounds = ROUND_CHOICES[self.rounds_var.get()]
         self.redundancy = REDUNDANCY_CHOICES[self.redun_var.get()]
-        self.layout = LAYOUT_CHOICES[self.layout_var.get()]
-        if self.layout:
-            # 双开：每个窗口占屏幕一半，底部预留任务栏高度。
-            self.win.update_idletasks()
-            sw = self.win.winfo_screenwidth()
-            sh = self.win.winfo_screenheight()
-            taskbar = 80
-            self.win_size = max(512, min(sw // 2 - 16, sh - taskbar))
-            self.win_pos = (0, 0) if self.layout == "left" else (sw - self.win_size - 8, 0)
+        self.n_windows = WINDOW_MODE_CHOICES[self.mode_var.get()]
+        self.monitor_a = self.mon_labels.get(self.screen_var.get(), 0)
+        # 屏幕几何（探测失败时 w=0，双窗口分支会用兜底尺寸）
+        for idx, w, h in self.monitors:
+            if idx == self.monitor_a:
+                self.mon_w, self.mon_h = (w, h) if w else (1920, 1080)
+                break
+        else:
+            self.mon_w, self.mon_h = 1920, 1080
+        self._done: dict[int, set[str]] = {}  # 轮次 -> 已完成分片名集合
 
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -290,8 +356,8 @@ class ClientApp:
     def emit(self, msg: str) -> None:
         self.queue.put(("log", msg))
 
-    def on_chunk_done(self, rnd, idx, name, frames, total_frames, n_chunks, rounds) -> None:
-        self.queue.put(("chunk", rnd, idx, name, frames, total_frames, n_chunks, rounds))
+    def on_chunk_done(self, rnd, idx, name, frames) -> None:
+        self.queue.put(("chunk", rnd, idx, name, frames))
 
     def finish(self) -> None:
         self.queue.put(("finish",))
@@ -319,10 +385,13 @@ class ClientApp:
         self.log.see("end")
         self.log.config(state="disabled")
 
-    def _update_progress(self, rnd, idx, name, frames, total_frames, n_chunks, rounds) -> None:
+    def _update_progress(self, rnd, idx, name, frames) -> None:
         elapsed = time.time() - self.start_time
-        # 以「轮」为粒度估算整体进度（单轮内按已传文件数近似）
-        frac_in_round = (idx + 1) / n_chunks
+        # 双窗口时两个进程的 file idx 各自独立，按「本轮去重后的已完成分片数」计进度
+        self._done.setdefault(rnd, set()).add(name)
+        n_chunks = self.job.n_chunks
+        rounds = self.rounds
+        frac_in_round = len(self._done[rnd]) / max(n_chunks, 1)
         if rounds:
             overall = ((rnd - 1) + frac_in_round) / rounds
         else:
@@ -333,7 +402,7 @@ class ClientApp:
         eta_s = f"，预计剩余 {int(eta // 60)} 分 {int(eta % 60)} 秒" if eta > 0 else ""
         self.status_var.set(
             f"第 {rnd}{'/∞' if not rounds else '/' + str(rounds)} 轮 · "
-            f"分片 {idx + 1}/{n_chunks}（{name}，{frames} 帧）· "
+            f"分片 {len(self._done[rnd])}/{n_chunks}（最新: {name}，{frames} 帧）· "
             f"已用 {int(elapsed // 60)} 分 {int(elapsed % 60)} 秒{eta_s}")
 
 

@@ -156,12 +156,21 @@ def collect() -> None:
         shutil.copy2(path, dst)
         print(f"[+] {dst}")
 
-    # Windows: 收集运行时依赖 DLL（vcpkg 动态库 + ANGLE）
+    # Windows: 收集运行时依赖 DLL
+    # 两个来源取并集：
+    #   1) 构建树中被 POST_BUILD 拷到各 exe 输出目录的 DLL（直接链接依赖）；
+    #   2) vcpkg_installed/x64-windows/bin（兜底：ANGLE 等动态加载库不在链接表里）
     if IS_WINDOWS:
-        for src_dir in (build_dir / "Release",):
-            for dll in src_dir.glob("*.dll"):
+        seen: set[str] = set()
+        sources = list(build_dir.rglob("*.dll"))
+        vcpkg_bin = build_dir / "vcpkg_installed" / "x64-windows" / "bin"
+        if vcpkg_bin.is_dir():
+            sources += list(vcpkg_bin.glob("*.dll"))
+        for dll in sources:
+            if dll.is_file() and dll.name not in seen:
+                seen.add(dll.name)
                 shutil.copy2(dll, BIN_DIR / dll.name)
-        print("[+] 已收集 DLL 到 bin/")
+        print(f"[+] 已收集 {len(seen)} 个 DLL 到 bin/")
 
 
 def main() -> None:

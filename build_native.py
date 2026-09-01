@@ -20,6 +20,7 @@ Windows 前置要求：
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import platform
 import shutil
@@ -157,18 +158,27 @@ def collect() -> None:
         print(f"[+] {dst}")
 
     # Windows: 收集运行时依赖 DLL
-    # 两个来源取并集：
+    # 来源：
     #   1) 构建树中被 POST_BUILD 拷到各 exe 输出目录的 DLL（直接链接依赖）；
-    #   2) vcpkg_installed/x64-windows/bin（兜底：ANGLE 等动态加载库不在链接表里）
+    #   2) vcpkg_installed/x64-windows/bin（兜底：ANGLE 等动态加载库不在链接表里）；
+    #   3) VS Redist 的 VC++ 运行库（msvcp140/vcruntime140/concrt140）
+    # 排除所有 debug 目录下的调试版 DLL（约 120MB 死重，且依赖 msvcp140d 等不存在的运行库）
     if IS_WINDOWS:
         seen: set[str] = set()
-        sources = list(build_dir.rglob("*.dll"))
+        sources = [p for p in build_dir.rglob("*.dll")
+                   if "debug" not in {part.lower() for part in p.parts}]
         vcpkg_bin = build_dir / "vcpkg_installed" / "x64-windows" / "bin"
         if vcpkg_bin.is_dir():
             sources += list(vcpkg_bin.glob("*.dll"))
+        redist_patterns = [
+            r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT\*.dll",
+            r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT\*.dll",
+        ]
+        for pat in redist_patterns:
+            sources += [Path(d) for d in glob.glob(pat)]
         for dll in sources:
-            if dll.is_file() and dll.name not in seen:
-                seen.add(dll.name)
+            if dll.is_file() and dll.name.lower() not in seen:
+                seen.add(dll.name.lower())
                 shutil.copy2(dll, BIN_DIR / dll.name)
         print(f"[+] 已收集 {len(seen)} 个 DLL 到 bin/")
 

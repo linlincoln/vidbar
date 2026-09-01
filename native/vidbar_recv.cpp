@@ -149,6 +149,7 @@ int main(int argc, char** argv)
 	unsigned height = result["height"].as<unsigned>();
 	unsigned wantFps = result["fps"].as<unsigned>();
 	unsigned statsEvery = result["stats"].as<unsigned>();
+	int colorCorrection = result["ccm"].as<int>();
 
 	cimbar::Config::update(parse_mode(result["mode"].as<string>()));
 
@@ -185,13 +186,15 @@ int main(int argc, char** argv)
 	double realW = vc.get(cv::CAP_PROP_FRAME_WIDTH);
 	double realH = vc.get(cv::CAP_PROP_FRAME_HEIGHT);
 	double realFps = vc.get(cv::CAP_PROP_FPS);
-	double realFc = vc.get(cv::CAP_PROP_FOURCC);
-	string fcStr = realFc != 0
-		? string(reinterpret_cast<char*>(&realFc), std::min<size_t>(4, sizeof(realFc)))
-		: string();
-	for (char& c : fcStr)
-		if (c < 0x20 or c > 0x7e)
-			c = '?';
+	// fourcc 以整数值 double 返回（见 OpenCV videowriter_basic 示例），
+	// 必须先转 int 再按小端拆字节；直接按 double 内存拆只会得到低尾零字节。
+	uint32_t fcInt = static_cast<uint32_t>(vc.get(cv::CAP_PROP_FOURCC));
+	string fcStr;
+	for (unsigned i = 0; i < 4; ++i)
+	{
+		char c = static_cast<char>((fcInt >> (8 * i)) & 0xFF);
+		fcStr += (c >= 0x20 and c <= 0x7e) ? c : '?';
+	}
 
 	emit(fmt::format(R"({{"ev":"open","source":"{}","device":{},"w":{},"h":{},"fps":{},"fourcc":"{}"}})",
 		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr)));
@@ -207,6 +210,8 @@ int main(int argc, char** argv)
 	uint64_t frames = 0, decoded = 0;
 	auto t0 = std::chrono::high_resolution_clock::now();
 	auto lastSignalT = t0;
+	auto lastDecodeT = t0;
+	bool hasDecoded = false;
 	bool locked = false;
 	unsigned consecutiveReadFail = 0;
 
@@ -232,6 +237,7 @@ int main(int argc, char** argv)
 
 		bool frameGood = false;
 		bool shouldPreprocess = false;
+		int decodedBytes = 0;
 		int res = ext.extract(img, img);
 		if (res)
 		{
@@ -239,16 +245,28 @@ int main(int argc, char** argv)
 			if (res == Extractor::NEEDS_SHARPEN)
 				shouldPreprocess = true;
 
-			int bytes = dec.decode_fountain(img, sink, shouldPreprocess);
-			if (bytes > 0)
+			decodedBytes = dec.decode_fountain(img, sink, shouldPreprocess, colorCorrection);
+			if (decodedBytes > 0)
 				++decoded;
 		}
+		if (std::getenv("VIDBAR_DEBUG"))
+			std::cerr << fmt::format("[dbg] frame={} extract={} bytes={}", frames, res, decodedBytes) << std::endl;
 
-		// 信号锁定判定：最近 2 秒内有过成功的角点提取
+		// 信号锁定判定（带迟滞）：
+		//   成为锁定：必须解出过数据帧（蓝屏/无信号画面骗不过解码器）；
+		//   维持锁定：角点提取成功即可（容忍瞬时解码失败）。
 		auto now = std::chrono::high_resolution_clock::now();
 		if (frameGood)
 			lastSignalT = now;
-		bool nowLocked = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSignalT).count() < 2000;
+		if (decodedBytes > 0)
+		{
+			lastDecodeT = now;
+			hasDecoded = true;
+		}
+		bool extractRecent = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSignalT).count() < 2000;
+		bool decodeRecent = hasDecoded and
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDecodeT).count() < 5000;
+		bool nowLocked = locked ? extractRecent : decodeRecent;
 		if (nowLocked != locked)
 		{
 			locked = nowLocked;

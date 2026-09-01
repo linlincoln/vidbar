@@ -40,6 +40,11 @@ ROUND_CHOICES = {"1 轮（最快，要求服务端从头接收）": 1,
                  "3 轮（最稳）": 3,
                  "无限循环（手动停止）": 0}
 REDUNDANCY_CHOICES = {"快速 1.3x": 1.3, "标准 1.6x": 1.6, "保守 2.2x": 2.2}
+# 窗口布局：双开时两个客户端分别选左/右半屏，播放窗口并排互不遮挡。
+# 窗口尺寸取屏幕一半再留边，码图约 0.9x 缩放，对解码影响很小。
+LAYOUT_CHOICES = {"自动（单开，自动避开任务栏）": None,
+                  "左半屏（双开-左）": "left",
+                  "右半屏（双开-右）": "right"}
 
 ROUND_FILE_RE = re.compile(r"round (\d+) file (\d+) \((.*?)\): (\d+) frames")
 
@@ -92,8 +97,14 @@ class TransferJob(threading.Thread):
         # ---- 启动 vidbar_send ----
         base = int(sid[:2], 16) & 0x7F
         cmd = [str(SENDER), "-f", str(fps), "-r", str(rounds),
-               "-R", str(redun), "-b", str(base)] + files
-        app.emit("启动播放窗口，请把它拖到被采集的显示器上 ...")
+               "-R", str(redun), "-b", str(base)]
+        if app.layout:  # 双开布局：固定窗口尺寸与位置，与另一侧并排
+            cmd += ["--win", f"{app.win_size}x{app.win_size}",
+                    "--pos", f"{app.win_pos[0]},{app.win_pos[1]}"]
+        cmd += files
+        app.emit("启动播放窗口，请把它拖到被采集的显示器上 ..." if not app.layout
+                 else f"播放窗口已定位到{'左' if app.layout == 'left' else '右'}半屏"
+                      f"（{app.win_size}x{app.win_size}）")
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.PIPE,
@@ -170,6 +181,7 @@ class ClientApp:
         self.rounds_var = tk.StringVar(value=list(ROUND_CHOICES)[1])
         self.redun_var = tk.StringVar(value=list(REDUNDANCY_CHOICES)[1])
         self.chunk_var = tk.StringVar(value=str(common.DEFAULT_CHUNK_MB))
+        self.layout_var = tk.StringVar(value=list(LAYOUT_CHOICES)[0])
 
         row = ttk.Frame(settings)
         row.pack(fill="x", padx=8, pady=4)
@@ -186,7 +198,14 @@ class ClientApp:
         ttk.Label(row2, text="分片大小 (MB)").pack(side="left")
         ttk.Spinbox(row2, from_=common.MIN_CHUNK_MB, to=128, textvariable=self.chunk_var,
                     width=6).pack(side="left", padx=(2, 12))
-        ttk.Label(row2, text="（大文件建议 8~32MB；分片越小，服务端中途加入恢复越快）").pack(side="left")
+        ttk.Label(row2, text="窗口布局").pack(side="left")
+        ttk.Combobox(row2, textvariable=self.layout_var, values=list(LAYOUT_CHOICES),
+                     state="readonly", width=24).pack(side="left", padx=(2, 12))
+        ttk.Label(row2, text="（双开时两个客户端分别选左/右半屏）").pack(side="left")
+
+        row3 = ttk.Frame(settings)
+        row3.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row3, text="（大文件建议 8~32MB；分片越小，服务端中途加入恢复越快）").pack(side="left")
 
         status = ttk.LabelFrame(self.win, text="状态")
         status.pack(fill="x", **pad)
@@ -240,6 +259,15 @@ class ClientApp:
         self.fps = FPS_CHOICES[self.fps_var.get()]
         self.rounds = ROUND_CHOICES[self.rounds_var.get()]
         self.redundancy = REDUNDANCY_CHOICES[self.redun_var.get()]
+        self.layout = LAYOUT_CHOICES[self.layout_var.get()]
+        if self.layout:
+            # 双开：每个窗口占屏幕一半，底部预留任务栏高度。
+            self.win.update_idletasks()
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            taskbar = 80
+            self.win_size = max(512, min(sw // 2 - 16, sh - taskbar))
+            self.win_pos = (0, 0) if self.layout == "left" else (sw - self.win_size - 8, 0)
 
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")

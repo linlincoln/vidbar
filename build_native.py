@@ -69,6 +69,15 @@ def inject_vidbar_recv() -> None:
         shutil.copyfile(NATIVE_DIR / f"{exe}.cpp", exe_dir / f"{exe}.cpp")
         shutil.copyfile(NATIVE_DIR / f"{exe}_CMakeLists.txt", exe_dir / "CMakeLists.txt")
 
+    # 覆盖上游 zstd_compressor.h：pad() 改用伪随机字节填充。
+    # 零填充会让小文件（如 manifest）的喷泉码块零主导，编码画面出现大片
+    # 均匀色块 -> 接收端产生假锚点、挤掉真角点 -> deskew 错乱 -> 解码失败。
+    zstd_patch = NATIVE_DIR / "zstd_compressor.h"
+    if zstd_patch.exists():
+        dst = SRC_TREE / "src" / "lib" / "compression" / "zstd_compressor.h"
+        shutil.copyfile(zstd_patch, dst)
+        print("[+] 已注入 zstd_compressor.h 补丁（随机填充修复小文件解码）")
+
     root_cmake = SRC_TREE / "CMakeLists.txt"
     text = root_cmake.read_text(encoding="utf-8")
     changed = False

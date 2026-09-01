@@ -10,6 +10,10 @@
  *  --rounds 0 表示无限循环，直到窗口被关闭或进程被终止。
  */
 
+#ifdef _WIN32
+#define NOMINMAX // windows.h 的 min/max 宏会破坏 std::min/std::max（须在所有 include 之前）
+#endif
+
 #include "cimb_translator/Config.h"
 #include "encoder/EncoderPlus.h"
 #include "gui/window_glfw.h"

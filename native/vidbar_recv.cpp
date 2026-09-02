@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using std::string;
@@ -179,7 +180,75 @@ int main(int argc, char** argv)
 	else if (api == "v4l2") apiPref = cv::CAP_V4L2;
 
 	if (isDevice)
-		vc.open(static_cast<int>(std::stoul(source)), apiPref);
+	{
+		// 格式自动协商：不少 DSHOW 驱动会悄悄把 MJPG 回落成 YUY2（无压缩，
+		// 带宽需求几十倍于 MJPG，实际帧率会从 60 掉到个位数）。
+		// 依次尝试：指定后端@请求帧率 -> 指定后端@30fps -> 备选后端@请求帧率
+		// -> 备选后端@30fps；读回 FOURCC 匹配才算成功，全失败接受最后一次。
+		int devIdx = static_cast<int>(std::stoul(source));
+		int fc = fourcc_or_zero(fourcc);
+		int altPref = cv::CAP_ANY;
+#ifdef _WIN32
+		if (apiPref == cv::CAP_DSHOW) altPref = cv::CAP_MSMF;
+		else if (apiPref == cv::CAP_MSMF) altPref = cv::CAP_DSHOW;
+#endif
+		std::vector<std::pair<int, unsigned>> attempts;
+		attempts.emplace_back(apiPref, wantFps);
+		if (fc and altPref != cv::CAP_ANY)
+		{
+			unsigned half = wantFps ? std::min(wantFps, 30u) : 30u;
+			attempts.emplace_back(apiPref, half);
+			attempts.emplace_back(altPref, wantFps);
+			attempts.emplace_back(altPref, half);
+		}
+
+		auto applyFormat = [&](unsigned fpsTry)
+		{
+			if (fc)
+				vc.set(cv::CAP_PROP_FOURCC, fc);
+			vc.set(cv::CAP_PROP_FRAME_WIDTH, width);
+			vc.set(cv::CAP_PROP_FRAME_HEIGHT, height);
+			if (fpsTry)
+				vc.set(cv::CAP_PROP_FPS, fpsTry);
+			// 有些驱动改分辨率/帧率时丢 FOURCC，重设一遍再读回校验。
+			if (fc)
+			{
+				vc.set(cv::CAP_PROP_FOURCC, fc);
+				if (fpsTry)
+					vc.set(cv::CAP_PROP_FPS, fpsTry);
+			}
+		};
+
+		bool negotiated = false;
+		for (auto& [apiTry, fpsTry] : attempts)
+		{
+			vc.open(devIdx, apiTry);
+			if (!vc.isOpened())
+			{
+				vc.release();
+				continue;
+			}
+			applyFormat(fpsTry);
+			uint32_t got = static_cast<uint32_t>(vc.get(cv::CAP_PROP_FOURCC));
+			if (!fc or got == static_cast<uint32_t>(fc))
+			{
+				negotiated = true;
+				break;
+			}
+			vc.release();
+		}
+		if (!negotiated and !vc.isOpened())
+		{
+			// 协商链全失败：按原始参数开一次，能开就先凑合用。
+			vc.open(devIdx, apiPref);
+			if (!vc.isOpened())
+			{
+				emit(fmt::format(R"({{"ev":"error","msg":"failed to open source '{}'"}})", json_escape(source)));
+				return 70;
+			}
+			applyFormat(wantFps);
+		}
+	}
 	else
 		vc.open(source, cv::CAP_FFMPEG);
 
@@ -187,26 +256,6 @@ int main(int argc, char** argv)
 	{
 		emit(fmt::format(R"({{"ev":"error","msg":"failed to open source '{}'"}})", json_escape(source)));
 		return 70;
-	}
-
-	if (isDevice)
-	{
-		int fc = fourcc_or_zero(fourcc);
-		if (fc)
-			vc.set(cv::CAP_PROP_FOURCC, fc);
-		vc.set(cv::CAP_PROP_FRAME_WIDTH, width);
-		vc.set(cv::CAP_PROP_FRAME_HEIGHT, height);
-		if (wantFps)
-			vc.set(cv::CAP_PROP_FPS, wantFps);
-		// 有些 DSHOW 驱动在改分辨率/帧率时会丢掉 FOURCC，回落到 YUY2 无压缩
-		// （带宽需求约为 MJPG 的几十倍，USB 带宽不足时实际帧率会骤降）。
-		// 重设一遍再读回校验，实际格式随 open 事件上报。
-		if (fc)
-		{
-			vc.set(cv::CAP_PROP_FOURCC, fc);
-			if (wantFps)
-				vc.set(cv::CAP_PROP_FPS, wantFps);
-		}
 	}
 
 	double realW = vc.get(cv::CAP_PROP_FRAME_WIDTH);

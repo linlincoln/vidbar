@@ -118,6 +118,8 @@ class Server:
         self._last_stat: dict = {}
         self._last_stat_print = 0.0
         self._t0 = time.time()
+        self._last_signal_print = 0.0
+        self._lost_printed = False
 
     # ---------- 主循环 ----------
 
@@ -259,10 +261,7 @@ class Server:
             if fps and fps < 29:
                 print("[!] 注意: 实际帧率低于 30，请检查采集卡是否工作在 MJPG 模式")
         elif kind == "signal":
-            if ev.get("locked"):
-                print("[+] 信号锁定：检测到 vidtx/cimbar 画面")
-            else:
-                print("[-] 信号丢失")
+            self._on_signal(bool(ev.get("locked")))
         elif kind == "saved":
             self._on_saved(Path(ev["path"]))
         elif kind == "stat":
@@ -368,8 +367,28 @@ class Server:
             sess.adopt_existing()
             self._check_complete(sess)
 
+    def _on_signal(self, locked: bool) -> None:
+        """信号锁定/丢失：限流 + 只在打印过「丢失」后才打印「锁定」，
+        空闲等待时的临界抖动一条都不刷（真正的收发进度由分片/诊断行体现）。"""
+        now = time.time()
+        if now - self._last_signal_print < 20:
+            return
+        if locked:
+            if not self._lost_printed:
+                return
+            self._lost_printed = False
+            self._last_signal_print = now
+            print("[+] 信号锁定：检测到 vidtx/cimbar 画面")
+        else:
+            self._lost_printed = True
+            self._last_signal_print = now
+            print("[-] 信号丢失")
+
     def _print_stat(self, ev: dict) -> None:
         """换行打印解码诊断（\r 原地刷新在 PowerShell 里既不显眼也没法复制反馈）。"""
+        prog = ev.get("progress") or []
+        if not ev.get("streams") and not prog:
+            return  # 空闲等待信号：不刷诊断
         now = time.time()
         if now - self._last_stat_print < 8:
             return
@@ -377,7 +396,6 @@ class Server:
 
         prefer = ev.get("prefer")
         layout = {1: "条带", 2: "整帧"}.get(prefer, "探测中")
-        prog = ev.get("progress") or []
         prog_s = ",".join(f"{p * 100:.0f}%" for p in prog) or "-"
         mins = int((now - self._t0) // 60)
         print(f"[诊断 {mins:02d}m] 帧数={ev.get('frames', 0)} 实际采集={ev.get('readfps', 0):.0f}fps "

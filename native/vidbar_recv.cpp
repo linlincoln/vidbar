@@ -23,6 +23,7 @@
 #include <opencv2/videoio.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -68,7 +69,7 @@ void emit(const string& line)
 
 // 完成一个流时回调：解压落盘 + 输出 JSON 事件
 std::function<std::string(const std::string&, const std::vector<uint8_t>&)> make_store(
-	const string& outdir, std::shared_ptr<uint64_t> savedCount)
+	const string& outdir, std::shared_ptr<std::atomic<uint64_t>> savedCount)
 {
 	return [outdir, savedCount](const std::string& fallback_name, const std::vector<uint8_t>& data)
 	{
@@ -317,9 +318,7 @@ int main(int argc, char** argv)
 		json_escape(source), isDevice ? 1 : 0, (int)realW, (int)realH, realFps, json_escape(fcStr), wantSplit));
 
 	unsigned chunkSize = cimbar::Config::fountain_chunk_size();
-	auto savedCount = std::make_shared<uint64_t>(0);
-	// 一个 sink 收所有流：分片头部带 encode_id，双窗口两条码流天然互不混淆。
-	fountain_decoder_sink sink(chunkSize, make_store(outdir, savedCount));
+	auto savedCount = std::make_shared<std::atomic<uint64_t>>(0);
 
 	// 每个竖条一条独立解码管线（角点跟踪/色彩校正等有状态，不能共享）。
 	// 多码流模式额外加一条整帧管线（下标 strips）：条带提不出角点时回退整帧解码，
@@ -333,15 +332,28 @@ int main(int argc, char** argv)
 		decs.emplace_back(new Decoder());
 	}
 
+	// 每条管线配一个独立 sink：fountain_decoder_sink 内部是无锁 unordered_map，
+	// 条带并行解码时绝不能共享。流状态独立无碍——每条码流恰好只进一个 sink
+	// （左半屏的流恒进 sink[0]、右半屏恒进 sink[1]）。
+	vector<std::unique_ptr<fountain_decoder_sink>> sinks;
+	for (unsigned i = 0; i < pipelines; ++i)
+		sinks.emplace_back(new fountain_decoder_sink(chunkSize, make_store(outdir, savedCount)));
+
 	cv::Mat mat;
 	uint64_t frames = 0, decoded = 0;
 	uint64_t stripExtOk = 0, stripDecOk = 0, fullExtOk = 0, fullDecOk = 0;
-	auto t0 = std::chrono::high_resolution_clock::now();
+	using clk = std::chrono::high_resolution_clock;
+	auto msBetween = [](const clk::time_point& a, const clk::time_point& b)
+	{ return std::chrono::duration_cast<std::chrono::milliseconds>(a - b).count(); };
+	auto t0 = clk::now();
 	auto lastStatT = t0;
 	auto lastSignalT = t0;
 	auto lastDecodeT = t0;
 	bool hasDecoded = false;
-	bool locked = false;
+	bool locked = false;      // 内部迟滞状态（即时翻转，供迟滞判定用）
+	bool printedLocked = false; // 已上报给外界的锁定状态
+	bool pendingLocked = false;
+	auto pendingT = t0;
 	unsigned consecutiveReadFail = 0;
 	// 码流布局自适应：0=未定 1=条带 2=整帧。谁先解出数据锁定谁（省 CPU）；
 	// 长期提不出角点则重置重探——用户中途增减窗口也能自愈。
@@ -366,10 +378,9 @@ int main(int argc, char** argv)
 		consecutiveReadFail = 0;
 		++frames;
 
-		cv::UMat img = mat.getUMat(cv::ACCESS_RW).clone();
-
-		// --split：一帧竖切 N 条，每条独立提角点+解码（同屏并排多码流）。
-		// 自适应：条带全提不出角点时回退整帧管线；布局锁定后跳过另一侧省 CPU。
+		// --split：一帧竖切 N 条，每条独立管线【并行】解码（同屏并排多码流）。
+		// 双码流串行解码是吞吐瓶颈：处理速率会被压到 ~30fps；并行后各占一核，
+		// 恢复满帧率。布局锁定后跳过另一侧省 CPU。
 		bool frameGood = false;
 		int decodedBytes = 0;
 		bool stripDecoded = false;
@@ -378,13 +389,14 @@ int main(int argc, char** argv)
 		{
 			// 单码流：整帧解码（strips>=2 时用专用的整帧管线，下标 strips）
 			unsigned fullIdx = strips >= 2 ? strips : 0;
+			cv::UMat img = mat.getUMat(cv::ACCESS_RW).clone();
 			cv::UMat out;
 			int res = exts[fullIdx]->extract(img, out);
 			if (res)
 			{
 				frameGood = true;
 				++fullExtOk;
-				int nbytes = decs[fullIdx]->decode_fountain(out, sink,
+				int nbytes = decs[fullIdx]->decode_fountain(out, *sinks[fullIdx],
 					res == Extractor::NEEDS_SHARPEN, colorCorrection);
 				if (nbytes > 0)
 				{
@@ -396,37 +408,58 @@ int main(int argc, char** argv)
 		}
 		else
 		{
+			// 条带并行：每个线程只写各自的 ss[s] 槽位，join 后统一汇总，无竞争。
+			struct StripStat { bool extracted; int bytes; };
+			vector<StripStat> ss(strips, {false, 0});
+			vector<std::thread> pool;
+			pool.reserve(strips);
 			for (unsigned s = 0; s < strips; ++s)
 			{
-				cv::UMat out;
-				int x0 = static_cast<int>(static_cast<long long>(mat.cols) * s / strips);
-				int x1 = static_cast<int>(static_cast<long long>(mat.cols) * (s + 1) / strips);
-				cv::UMat strip = img(cv::Rect(x0, 0, x1 - x0, mat.rows));
-				int res = exts[s]->extract(strip, out);
-				if (!res)
-					continue;
-				frameGood = true;
-				stripExtracted = true;
-				++stripExtOk;
-				int nbytes = decs[s]->decode_fountain(out, sink,
-					res == Extractor::NEEDS_SHARPEN, colorCorrection);
-				if (nbytes > 0)
+				pool.emplace_back([&, s]
+				{
+					int x0 = static_cast<int>(static_cast<long long>(mat.cols) * s / strips);
+					int x1 = static_cast<int>(static_cast<long long>(mat.cols) * (s + 1) / strips);
+					// 只上传本条带 ROI（比整帧 clone 省；且连续内存利于后续处理）
+					cv::UMat strip, out;
+					mat(cv::Rect(x0, 0, x1 - x0, mat.rows)).copyTo(strip);
+					int res = exts[s]->extract(strip, out);
+					if (!res)
+						return;
+					ss[s].extracted = true;
+					int nbytes = decs[s]->decode_fountain(out, *sinks[s],
+						res == Extractor::NEEDS_SHARPEN, colorCorrection);
+					ss[s].bytes = nbytes > 0 ? nbytes : 0;
+				});
+			}
+			for (auto& t : pool)
+				t.join();
+			for (unsigned s = 0; s < strips; ++s)
+			{
+				if (ss[s].extracted)
+				{
+					frameGood = true;
+					stripExtracted = true;
+					++stripExtOk;
+				}
+				if (ss[s].bytes > 0)
 				{
 					++decoded;
-					decodedBytes += nbytes;
+					decodedBytes += ss[s].bytes;
 					stripDecoded = true;
+					++stripDecOk;
 				}
 			}
-			// 整帧回退：布局未定，或条带全提不出角点（码流跨条带边界/单码流居中）
-			if (layoutPrefer != 1 or !stripExtracted)
+			// 整帧回退：所有条带都提不出角点（码流居中/跨条带边界）时用整帧管线
+			if (!stripExtracted)
 			{
+				cv::UMat img = mat.getUMat(cv::ACCESS_RW).clone();
 				cv::UMat out;
 				int res = exts[strips]->extract(img, out);
 				if (res)
 				{
 					frameGood = true;
 					++fullExtOk;
-					int nbytes = decs[strips]->decode_fountain(out, sink,
+					int nbytes = decs[strips]->decode_fountain(out, *sinks[strips],
 						res == Extractor::NEEDS_SHARPEN, colorCorrection);
 					if (nbytes > 0)
 					{
@@ -455,10 +488,13 @@ int main(int argc, char** argv)
 			std::cerr << fmt::format("[dbg] frame={} strips={} prefer={} extract={} bytes={}",
 				frames, strips, layoutPrefer, frameGood, decodedBytes) << std::endl;
 
-		// 信号锁定判定（带迟滞）：
-		//   成为锁定：必须解出过数据帧（蓝屏/无信号画面骗不过解码器）；
-		//   维持锁定：角点提取成功即可（容忍瞬时解码失败）。
-		auto now = std::chrono::high_resolution_clock::now();
+		// 信号锁定判定（带迟滞 + 防抖上报）：
+		//   成为锁定：角点提取新鲜 且（曾解出数据且 5s 内有解码）——
+		//   蓝屏/无信号画面骗不过解码器；
+		//   维持锁定：角点提取新鲜即可（容忍瞬时解码失败）。
+		// 注意「成为锁定」也要求 extractRecent：否则解码窗口（5s）还没过期时，
+		// 会在「解锁→立刻重锁→下一帧又解锁」间逐帧翻转，刷屏就是这样来的。
+		auto now = clk::now();
 		if (frameGood)
 			lastSignalT = now;
 		if (decodedBytes > 0)
@@ -466,32 +502,47 @@ int main(int argc, char** argv)
 			lastDecodeT = now;
 			hasDecoded = true;
 		}
-		bool extractRecent = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSignalT).count() < 2000;
-		bool decodeRecent = hasDecoded and
-			std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDecodeT).count() < 5000;
-		bool nowLocked = locked ? extractRecent : decodeRecent;
-		if (nowLocked != locked)
+		bool extractRecent = msBetween(now, lastSignalT) < 2000;
+		bool decodeRecent = hasDecoded and msBetween(now, lastDecodeT) < 5000;
+		bool nowLocked = extractRecent and (locked or decodeRecent);
+		locked = nowLocked;
+		// 防抖：新状态须稳定 2s 才上报；临界信号下的短促抖动一条都不发。
+		if (locked != printedLocked)
 		{
-			locked = nowLocked;
-			emit(fmt::format(R"({{"ev":"signal","locked":{}}})", locked ? "true" : "false"));
+			if (locked != pendingLocked)
+			{
+				pendingLocked = locked;
+				pendingT = now;
+			}
+			else if (msBetween(now, pendingT) >= 2000)
+			{
+				printedLocked = locked;
+				emit(fmt::format(R"({{"ev":"signal","locked":{}}})", printedLocked ? "true" : "false"));
+			}
 		}
+		else
+			pendingLocked = printedLocked;
 
 		// 统计按时间触发（≥2 秒一次）：实际帧率很低时按帧数触发会长时间无输出，
 		// 而低帧率恰恰是最需要看到 readfps 诊断的时刻。
-		if (statsEvery and (frames % statsEvery == 0 or
-			std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatT).count() >= 2000))
+		if (statsEvery and (frames % statsEvery == 0 or msBetween(now, lastStatT) >= 2000))
 		{
 			lastStatT = now;
-			double secs = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() / 1000.0;
+			double secs = msBetween(now, t0) / 1000.0;
+			unsigned totalStreams = 0;
 			string progress;
-			for (double p : sink.get_progress())
-				progress += (progress.empty() ? "" : ",") + fmt::format("{:.3f}", p);
+			for (auto& sk : sinks)
+			{
+				totalStreams += sk->num_streams();
+				for (double p : sk->get_progress())
+					progress += (progress.empty() ? "" : ",") + fmt::format("{:.3f}", p);
+			}
 			emit(fmt::format(R"({{"ev":"stat","frames":{},"decoded":{},"saved":{},"readfps":{:.1f},"streams":{},"progress":[{}],"prefer":{},"sext":{},"sdec":{},"fext":{},"fdec":{}}})",
-				frames, decoded, *savedCount, frames / (secs > 0 ? secs : 1), sink.num_streams(), progress,
+				frames, decoded, savedCount->load(), frames / (secs > 0 ? secs : 1), totalStreams, progress,
 				layoutPrefer, stripExtOk, stripDecOk, fullExtOk, fullDecOk));
 		}
 	}
 
-	emit(fmt::format(R"({{"ev":"exit","frames":{},"decoded":{},"saved":{}}})", frames, decoded, *savedCount));
+	emit(fmt::format(R"({{"ev":"exit","frames":{},"decoded":{},"saved":{}}})", frames, decoded, savedCount->load()));
 	return 0;
 }

@@ -218,8 +218,6 @@ int main(int argc, char** argv)
 				Attempt cand[] = {
 					{a, an, width, height, wantFps},
 					{a, an, 1280, 720, wantFps},
-					{a, an, width, height, 30u},
-					{a, an, 1280, 720, 30u},
 				};
 				for (auto& t : cand)
 					if (std::find_if(attempts.begin(), attempts.end(), [&](const Attempt& x)
@@ -264,13 +262,19 @@ int main(int argc, char** argv)
 			}
 			applyFormat(t.w, t.h, t.fps);
 			uint32_t got = static_cast<uint32_t>(vc.get(cv::CAP_PROP_FOURCC));
-			if (!fc or got == static_cast<uint32_t>(fc))
+			string gotStr = fourccStr(got);
+			// msmf 后端往往不回报 FOURCC（读回 0 -> "????"）：无法校验，
+			// 只能当成功接受，格式好坏由后续 readfps 诊断判定。
+			bool unknown = gotStr.find('?') != string::npos;
+			if (!fc or got == static_cast<uint32_t>(fc) or unknown)
 			{
+				if (unknown)
+					emit(R"({"ev":"negotiate","msg":"backend does not report fourcc, assuming ok"})");
 				negotiated = true;
 				break;
 			}
 			emit(fmt::format(R"({{"ev":"negotiate","msg":"got '{}' instead of '{}', next"}})",
-				json_escape(fourccStr(got)), json_escape(fourcc)));
+				json_escape(gotStr), json_escape(fourcc)));
 			vc.release();
 			// 驱动释放设备需要时间，立刻重开可能挂起
 			std::this_thread::sleep_for(std::chrono::milliseconds(300));

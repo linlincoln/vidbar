@@ -140,30 +140,33 @@ class Server:
               f"({self.args.fourcc}) | {split_desc}")
         print("等待信号...（Ctrl+C 退出）")
 
-        while not self.shutdown.is_set():
-            # 完成一个文件后延迟重启接收器（清理解码器 done 状态，防止后续传输撞 id）
-            if self._restart_at is not None and time.time() >= self._restart_at:
-                self._restart_at = None
-                self._kill_receiver()
+        try:
+            while not self.shutdown.is_set():
+                # 完成一个文件后延迟重启接收器（清理解码器 done 状态，防止后续传输撞 id）
+                if self._restart_at is not None and time.time() >= self._restart_at:
+                    self._restart_at = None
+                    self._kill_receiver()
 
-            if self.proc is None:
-                if self._restart_backoff():
-                    continue
-                self._spawn_receiver()
-            elif self.proc.poll() is not None:
-                if self.args.source is not None:
-                    # 视频文件模式：读尽剩余事件后正常结束
-                    self._pump_output()
-                    print("\n[i] 视频播放完毕，解码结束。")
-                    break
-                if self._restart_backoff():
-                    continue
-                self._spawn_receiver()
+                if self.proc is None:
+                    if self._restart_backoff():
+                        continue
+                    self._spawn_receiver()
+                elif self.proc.poll() is not None:
+                    if self.args.source is not None:
+                        # 视频文件模式：读尽剩余事件后正常结束
+                        self._pump_output()
+                        print("\n[i] 视频播放完毕，解码结束。")
+                        break
+                    if self._restart_backoff():
+                        continue
+                    self._spawn_receiver()
 
-            self._pump_output()
-            time.sleep(0.05)
-
-        self._kill_receiver()
+                self._pump_output()
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass  # Ctrl+C：跳到 finally 杀子进程（否则 vidbar_recv 残留并占用采集卡）
+        finally:
+            self._kill_receiver()
         print("\n已退出。")
 
     def _spawn_receiver(self) -> None:
@@ -250,9 +253,9 @@ class Server:
             req = (self.args.fourcc or "").upper()
             got = str(ev.get("fourcc") or "").upper()
             if req and got and "?" not in got and req != got:
-                print(f"[!] 警告: 请求 {req} 但采集卡实际工作在 {got}。"
-                      f"YUY2 等无压缩格式对 USB 带宽要求极高，实际帧率可能骤降"
-                      f"（看下方 readfps 诊断）；可尝试 --api msmf 或换 USB3 接口")
+                print(f"[!] 提示: 请求 {req} 但采集卡实际工作在 {got}。"
+                      f"若下方诊断 readfps ≥ 50 则无碍（USB3 带宽足够，"
+                      f"YUY2 无压缩画质反而更好）；若 readfps 骤降则说明带宽不足")
             if fps and fps < 29:
                 print("[!] 注意: 实际帧率低于 30，请检查采集卡是否工作在 MJPG 模式")
         elif kind == "signal":

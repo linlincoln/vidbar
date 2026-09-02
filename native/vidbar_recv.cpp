@@ -22,6 +22,7 @@
 
 #include <opencv2/videoio.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -181,33 +182,62 @@ int main(int argc, char** argv)
 
 	if (isDevice)
 	{
-		// 格式自动协商：不少 DSHOW 驱动会悄悄把 MJPG 回落成 YUY2（无压缩，
-		// 带宽需求几十倍于 MJPG，实际帧率会从 60 掉到个位数）。
-		// 依次尝试：指定后端@请求帧率 -> 指定后端@30fps -> 备选后端@请求帧率
-		// -> 备选后端@30fps；读回 FOURCC 匹配才算成功，全失败接受最后一次。
+		// 格式自动协商：不少采集卡驱动会悄悄把 MJPG 回落成 YUY2（无压缩，
+		// 带宽需求几十倍于 MJPG，实际帧率会从 60 掉到个位数）。常见规律是
+		// 1080p 只有 YUY2、MJPG 只支持到 720p —— 所以除了换后端、降帧率，
+		// 还要降分辨率试。每一步都发 negotiate 事件，绝不静默（否则像卡死）。
 		int devIdx = static_cast<int>(std::stoul(source));
 		int fc = fourcc_or_zero(fourcc);
 		int altPref = cv::CAP_ANY;
+		string altName;
 #ifdef _WIN32
-		if (apiPref == cv::CAP_DSHOW) altPref = cv::CAP_MSMF;
-		else if (apiPref == cv::CAP_MSMF) altPref = cv::CAP_DSHOW;
+		if (apiPref == cv::CAP_DSHOW) { altPref = cv::CAP_MSMF; altName = "msmf"; }
+		else if (apiPref == cv::CAP_MSMF) { altPref = cv::CAP_DSHOW; altName = "dshow"; }
 #endif
-		std::vector<std::pair<int, unsigned>> attempts;
-		attempts.emplace_back(apiPref, wantFps);
-		if (fc and altPref != cv::CAP_ANY)
+		auto fourccStr = [](uint32_t v)
 		{
-			unsigned half = wantFps ? std::min(wantFps, 30u) : 30u;
-			attempts.emplace_back(apiPref, half);
-			attempts.emplace_back(altPref, wantFps);
-			attempts.emplace_back(altPref, half);
+			string s;
+			for (unsigned i = 0; i < 4; ++i)
+			{
+				char c = static_cast<char>((v >> (8 * i)) & 0xFF);
+				s += (c >= 0x20 and c <= 0x7e) ? c : '?';
+			}
+			return s;
+		};
+
+		struct Attempt { int api; string apiName; unsigned w, h, fps; };
+		vector<Attempt> attempts;
+		if (!fc)
+		{
+			attempts.push_back({apiPref, api, width, height, wantFps});
+		}
+		else
+		{
+			auto addBackend = [&](int a, const string& an)
+			{
+				Attempt cand[] = {
+					{a, an, width, height, wantFps},
+					{a, an, 1280, 720, wantFps},
+					{a, an, width, height, 30u},
+					{a, an, 1280, 720, 30u},
+				};
+				for (auto& t : cand)
+					if (std::find_if(attempts.begin(), attempts.end(), [&](const Attempt& x)
+						{ return x.api == t.api and x.w == t.w and x.h == t.h
+							and x.fps == t.fps; }) == attempts.end())
+						attempts.push_back(t);
+			};
+			addBackend(apiPref, api);
+			if (altPref != cv::CAP_ANY)
+				addBackend(altPref, altName);
 		}
 
-		auto applyFormat = [&](unsigned fpsTry)
+		auto applyFormat = [&](unsigned w, unsigned h, unsigned fpsTry)
 		{
 			if (fc)
 				vc.set(cv::CAP_PROP_FOURCC, fc);
-			vc.set(cv::CAP_PROP_FRAME_WIDTH, width);
-			vc.set(cv::CAP_PROP_FRAME_HEIGHT, height);
+			vc.set(cv::CAP_PROP_FRAME_WIDTH, w);
+			vc.set(cv::CAP_PROP_FRAME_HEIGHT, h);
 			if (fpsTry)
 				vc.set(cv::CAP_PROP_FPS, fpsTry);
 			// 有些驱动改分辨率/帧率时丢 FOURCC，重设一遍再读回校验。
@@ -220,24 +250,32 @@ int main(int argc, char** argv)
 		};
 
 		bool negotiated = false;
-		for (auto& [apiTry, fpsTry] : attempts)
+		for (auto& t : attempts)
 		{
-			vc.open(devIdx, apiTry);
+			emit(fmt::format(R"({{"ev":"negotiate","msg":"trying {} {}x{}@{}"}})",
+				json_escape(t.apiName), t.w, t.h, t.fps));
+			vc.open(devIdx, t.api);
 			if (!vc.isOpened())
 			{
+				emit(R"({"ev":"negotiate","msg":"open failed, next"})");
 				vc.release();
+				std::this_thread::sleep_for(std::chrono::milliseconds(300));
 				continue;
 			}
-			applyFormat(fpsTry);
+			applyFormat(t.w, t.h, t.fps);
 			uint32_t got = static_cast<uint32_t>(vc.get(cv::CAP_PROP_FOURCC));
 			if (!fc or got == static_cast<uint32_t>(fc))
 			{
 				negotiated = true;
 				break;
 			}
+			emit(fmt::format(R"({{"ev":"negotiate","msg":"got '{}' instead of '{}', next"}})",
+				json_escape(fourccStr(got)), json_escape(fourcc)));
 			vc.release();
+			// 驱动释放设备需要时间，立刻重开可能挂起
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
 		}
-		if (!negotiated and !vc.isOpened())
+		if (!negotiated)
 		{
 			// 协商链全失败：按原始参数开一次，能开就先凑合用。
 			vc.open(devIdx, apiPref);
@@ -246,7 +284,7 @@ int main(int argc, char** argv)
 				emit(fmt::format(R"({{"ev":"error","msg":"failed to open source '{}'"}})", json_escape(source)));
 				return 70;
 			}
-			applyFormat(wantFps);
+			applyFormat(width, height, wantFps);
 		}
 	}
 	else

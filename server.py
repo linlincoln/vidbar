@@ -241,7 +241,9 @@ class Server:
 
     def _dispatch(self, ev: dict) -> None:
         kind = ev.get("ev")
-        if kind == "open":
+        if kind == "negotiate":
+            print(f"[.] 采集协商: {ev.get('msg')}")
+        elif kind == "open":
             fps = ev.get("fps", 0)
             print(f"[+] 信号源已打开: {ev.get('w')}x{ev.get('h')} @ {fps}fps "
                   f"({ev.get('fourcc')})")

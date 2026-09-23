@@ -85,6 +85,16 @@ def inject_vidbar_recv() -> None:
         shutil.copyfile(win_patch, dst)
         print("[+] 已注入 window_glfw.h 补丁（新增 set_pos）")
 
+    # 覆盖上游 EncoderPlus.h：小文件喷泉流帧数保底。
+    # 帧数整数截断会让小文件（manifest/小分片）每轮只渲染 1 帧，且 wirehair
+    # 每轮产生相同的块 —— 接收端丢掉这唯一帧里的个别块后 rank 永远补不齐，
+    # 流精确卡死（实测 80%）且无法自愈。保底 8 帧提供块汇聚余量。
+    enc_patch = NATIVE_DIR / "EncoderPlus.h"
+    if enc_patch.exists():
+        dst = SRC_TREE / "src" / "lib" / "encoder" / "EncoderPlus.h"
+        shutil.copyfile(enc_patch, dst)
+        print("[+] 已注入 EncoderPlus.h 补丁（小文件喷泉流帧数保底）")
+
     root_cmake = SRC_TREE / "CMakeLists.txt"
     text = root_cmake.read_text(encoding="utf-8")
     changed = False

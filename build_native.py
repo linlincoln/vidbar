@@ -150,7 +150,10 @@ def build() -> None:
         toolchain = vcpkg / "scripts" / "buildsystems" / "vcpkg.cmake"
         cmake_args += [
             f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
-            "-DVCPKG_TARGET_TRIPLET=x64-windows",
+            # 只编 release：跳过 ANGLE/opencv4 的 debug 编译（各需约 1 小时，
+            # 是 Windows 云编译"卡死"的元凶；vidtx 只发布 Release 二进制）
+            f"-DVCPKG_OVERLAY_TRIPLETS={ROOT / 'triplets'}",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-release",
         ]
         run(cmake_args)
         run(["cmake", "--build", str(build_dir), "--config", "Release",
@@ -165,6 +168,7 @@ def build() -> None:
 def collect() -> None:
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     build_dir = SRC_TREE / "build-vidtx"
+    triplet_name = "x64-windows-release" if IS_WINDOWS else "x64-windows"
 
     found: dict[str, Path] = {}
     for name in ("vidbar_send", "vidbar_recv"):
@@ -193,7 +197,7 @@ def collect() -> None:
         seen: set[str] = set()
         sources = [p for p in build_dir.rglob("*.dll")
                    if "debug" not in {part.lower() for part in p.parts}]
-        vcpkg_bin = build_dir / "vcpkg_installed" / "x64-windows" / "bin"
+        vcpkg_bin = build_dir / "vcpkg_installed" / triplet_name / "bin"
         if vcpkg_bin.is_dir():
             sources += list(vcpkg_bin.glob("*.dll"))
         redist_patterns = [
